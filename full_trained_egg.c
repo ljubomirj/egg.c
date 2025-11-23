@@ -69,7 +69,9 @@ static inline uint32_t xorshift32(uint32_t *state) {
 }
 
 static inline int8_t gen_noise_val(uint32_t *rng) {
-    return (int8_t)((xorshift32(rng) & 31) - 16);
+    // Unbiased generation [-15, 15]
+    uint32_t r = xorshift32(rng);
+    return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 15));
 }
 
 // --- The Core "Rank-1 Perturbed Matrix Mul" [cite: 68, 1009] ---
@@ -101,7 +103,8 @@ void matmul_perturbed(
         
         if (noise_sign != 0) {
             int32_t noise = (xB * (int32_t)A[i]) * noise_sign;
-            acc += (noise >> SIGMA_SHIFT);
+            // Fix scaling: Shift by FIXED_POINT + SIGMA_SHIFT to match JAX
+            acc += (noise >> (FIXED_POINT + SIGMA_SHIFT));
         }
         
         int32_t res = acc >> shift;
@@ -401,7 +404,37 @@ int main() {
     uint32_t init_rng = 42;
     for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) model->embedding[i] = gen_noise_val(&init_rng);
     for(int i=0; i<HIDDEN_DIM*VOCAB_SIZE; i++) model->head[i] = gen_noise_val(&init_rng);
-    // (Initialize other weights similarly... omitted for brevity)
+    
+    // Initialize GRU and MLP weights
+    for(int l=0; l<N_LAYERS; l++) {
+        // GRU Weights
+        for(int g=0; g<4; g++) {
+            for(int i=0; i<HIDDEN_DIM*HIDDEN_DIM; i++) {
+                model->gru_weights[l][g][i] = gen_noise_val(&init_rng);
+            }
+        }
+        // MLP Weights
+        for(int m=0; m<2; m++) {
+            // Size is HIDDEN * (HIDDEN*4), simplified in struct to flattened array
+             int size = (m == 0) ? (HIDDEN_DIM * HIDDEN_DIM) : (HIDDEN_DIM * HIDDEN_DIM); 
+             // Wait, struct def is: int8_t mlp_weights[N_LAYERS][2][HIDDEN_DIM * (HIDDEN_DIM * 4)];
+             // Actually the struct definition is:
+             // int8_t mlp_weights[N_LAYERS][2][HIDDEN_DIM * (HIDDEN_DIM * 4)];
+             // But in forward_pass, it does Hidden->Hidden for both?
+             // "We use a simplified MLP (Hidden -> Hidden) to save C-code ..."
+             // So we should just fill the allocated space?
+             // The allocated space is huge: HIDDEN * (HIDDEN * 4).
+             // But the forward pass uses:
+             // matmul_perturbed(x, model->mlp_weights[l][0], buf1, HIDDEN_DIM, HIDDEN_DIM, ...);
+             // matmul_perturbed(buf1, model->mlp_weights[l][1], x, HIDDEN_DIM, HIDDEN_DIM, ...);
+             // So it treats them as HIDDENxHIDDEN.
+             // We should initialize the part that is used: HIDDEN*HIDDEN.
+             for(int i=0; i<HIDDEN_DIM*HIDDEN_DIM; i++) {
+                 model->mlp_weights[l][m][i] = gen_noise_val(&init_rng);
+             }
+        }
+    }
+
     for(int l=0; l<N_LAYERS; l++) {
         for(int i=0; i<HIDDEN_DIM; i++) model->ln_weights[l][0][i] = 16; // Init LN scale
         for(int i=0; i<HIDDEN_DIM; i++) model->ln_weights[l][1][i] = 16;
