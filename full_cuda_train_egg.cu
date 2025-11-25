@@ -7,12 +7,14 @@
 #include <device_launch_parameters.h>
 
 // --- Configuration ---
+#define SM_CORES 46
 #define VOCAB_SIZE 256
-#define HIDDEN_DIM 512
+#define HIDDEN_DIM (SM_CORES * 8)
 #define N_LAYERS 4
 #define SEQ_LEN 4096
-#define POPULATION_SIZE 368
 #define BATCH 8 // Streaming batch size per block
+#define POPULATION_SIZE (SM_CORES * BATCH)
+#define SHARED_STRIDE (HIDDEN_DIM * 4)
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 4
 #define UPDATE_THRESHOLD 270
@@ -45,11 +47,6 @@ typedef struct {
     int8_t ln_weights[N_LAYERS][2][HIDDEN_DIM];
     int8_t ln_out[HIDDEN_DIM];
 } EggModel;
-
-// CPU-side Recurrent State for Sampling
-typedef struct {
-    int8_t h[N_LAYERS][HIDDEN_DIM];
-} RecurrentState;
 
 // Global Tables
 __device__ int32_t d_EXP2_TABLE[256];
@@ -133,154 +130,6 @@ void init_model(EggModel *model) {
     free(temp);
 }
 
-// --- HOST CPU SAMPLING LOGIC (Scalar) ---
-
-int8_t clip_h(int32_t a) {
-    return (a > MAX_VAL) ? MAX_VAL : ((a < MIN_VAL) ? MIN_VAL : (int8_t)a);
-}
-
-void cpu_ln(const int8_t *x, const int8_t *w, int8_t *out) {
-    int32_t sum = 0;
-    for(int i=0; i<HIDDEN_DIM; i++) sum += abs(x[i]);
-    if(sum == 0) sum = 1;
-    int32_t mean = sum / HIDDEN_DIM;
-    if(mean == 0) mean = 1;
-    for(int i=0; i<HIDDEN_DIM; i++) {
-        out[i] = clip_h(((int32_t)x[i] * w[i]) / mean);
-    }
-}
-
-// Standard Matrix Mul on Transposed Weights (as in Model struct)
-// W is [Input][Output].
-// In: [Input]. Out: [Output].
-void cpu_matmul(const int8_t *x, const int8_t *W, int8_t *out, int in_dim, int out_dim) {
-    for(int r=0; r<out_dim; r++) {
-        int32_t acc = 0;
-        // W is Col-Major wrt output? W index: k * out_dim + r
-        for(int k=0; k<in_dim; k++) {
-            acc += x[k] * W[k*out_dim + r];
-        }
-        out[r] = clip_h(acc >> 8);
-    }
-}
-
-// Different shift for MLP Project (9)
-void cpu_matmul_shift(const int8_t *x, const int8_t *W, int8_t *out, int in_dim, int out_dim, int shift) {
-    for(int r=0; r<out_dim; r++) {
-        int32_t acc = 0;
-        for(int k=0; k<in_dim; k++) {
-            acc += x[k] * W[k*out_dim + r];
-        }
-        out[r] = clip_h(acc >> shift);
-    }
-}
-
-void forward_pass_cpu(EggModel *model, int token, int8_t *logits, RecurrentState *h) {
-    int8_t x[HIDDEN_DIM];
-    int8_t buf1[HIDDEN_DIM]; // Temp for gates
-    int8_t buf2[HIDDEN_DIM]; // Temp for gates
-    // Embed
-    for(int i=0; i<HIDDEN_DIM; i++) x[i] = model->embedding[token * HIDDEN_DIM + i];
-    
-    int8_t expanded[2048];
-
-    for(int l=0; l<N_LAYERS; l++) {
-        int8_t residual[HIDDEN_DIM];
-        for(int i=0; i<HIDDEN_DIM; i++) residual[i] = x[i];
-        
-        cpu_ln(x, model->ln_weights[l][0], x);
-        
-        // GRU
-        // W0: Input->Buf1. W1: Hidden->Buf2.
-        cpu_matmul(x, model->gru_weights[l][0], buf1, HIDDEN_DIM, HIDDEN_DIM);
-        cpu_matmul(h->h[l], model->gru_weights[l][1], buf2, HIDDEN_DIM, HIDDEN_DIM);
-        
-        int8_t ft[HIDDEN_DIM]; // Combined gate
-        for(int i=0; i<HIDDEN_DIM; i++) 
-            ft[i] = clip_h((int32_t)buf1[i] + buf2[i] + model->gru_biases[l][0][i]);
-            
-        int8_t gated_past[HIDDEN_DIM];
-        for(int i=0; i<HIDDEN_DIM; i++) 
-            gated_past[i] = (int8_t)(((int32_t)(ft[i] + 127) * h->h[l][i]) >> 8);
-            
-        cpu_matmul(x, model->gru_weights[l][2], buf1, HIDDEN_DIM, HIDDEN_DIM);
-        cpu_matmul(gated_past, model->gru_weights[l][3], buf2, HIDDEN_DIM, HIDDEN_DIM);
-        
-        int8_t ht[HIDDEN_DIM];
-        for(int i=0; i<HIDDEN_DIM; i++)
-            ht[i] = clip_h((int32_t)buf1[i] + buf2[i] + model->gru_biases[l][1][i]);
-            
-        for(int i=0; i<HIDDEN_DIM; i++) {
-            int32_t diff = ht[i] - h->h[l][i];
-            int32_t update = ((int32_t)(ft[i] + 127) * diff) >> 8;
-            h->h[l][i] = clip_h(h->h[l][i] + update);
-            x[i] = h->h[l][i];
-        }
-        
-        for(int i=0; i<HIDDEN_DIM; i++) x[i] = clip_h((int32_t)x[i] + residual[i]);
-        
-        for(int i=0; i<HIDDEN_DIM; i++) residual[i] = x[i];
-        cpu_ln(x, model->ln_weights[l][1], x);
-        
-        // MLP Expand 512->2048
-        cpu_matmul(x, model->mlp_weights[l][0], expanded, HIDDEN_DIM, 2048);
-        // MLP Project 2048->512 (shift 9)
-        cpu_matmul_shift(expanded, model->mlp_weights[l][1], x, 2048, HIDDEN_DIM, 9);
-        
-        for(int i=0; i<HIDDEN_DIM; i++) x[i] = clip_h((int32_t)x[i] + residual[i]);
-    }
-    
-    cpu_ln(x, model->ln_out, x);
-    cpu_matmul(x, model->head, logits, HIDDEN_DIM, VOCAB_SIZE);
-}
-
-int sample_logits(int8_t *logits) {
-    int32_t probs[VOCAB_SIZE];
-    int32_t sum = 0;
-    for(int i=0; i<VOCAB_SIZE; i++) {
-        int idx = (int32_t)logits[i] + 128;
-        idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
-        probs[i] = h_EXP2_TABLE[idx];
-        sum += probs[i];
-    }
-    if(sum == 0) return 0;
-    int32_t r = rand() % sum;
-    int32_t acc = 0;
-    for(int i=0; i<VOCAB_SIZE; i++) {
-        acc += probs[i];
-        if(r < acc) return i;
-    }
-    return VOCAB_SIZE - 1;
-}
-
-void sample_model_host(EggModel *model, const uint8_t *seed_text, int seed_len, int gen_len) {
-    RecurrentState state;
-    for(int l=0; l<N_LAYERS; l++) for(int i=0; i<HIDDEN_DIM; i++) state.h[l][i] = 0;
-    
-    int8_t logits[VOCAB_SIZE];
-    
-    printf("\033[32m");
-    int input_token = 0;
-
-    for(int t=0; t < seed_len + gen_len; t++) {
-         if (t < seed_len) {
-            input_token = seed_text[t];
-            if(input_token >= 32 && input_token <= 126) printf("%c", input_token);
-            else printf(".");
-        } else {
-            if (t == seed_len) printf("\033[36m");
-            if(input_token >= 32 && input_token <= 126) printf("%c", input_token);
-            else printf(".");
-        }
-        
-        forward_pass_cpu(model, input_token, logits, &state);
-        
-        if(t >= seed_len - 1) {
-            input_token = sample_logits(logits);
-        }
-    }
-    printf("\033[0m\n");
-}
 
 // --- DEVICE ---
 
@@ -328,9 +177,199 @@ __device__ __forceinline__ int32_t blockReduceSum(int32_t val) {
     return shared[0];
 }
 
-extern __shared__ int8_t s_mem[]; // [BATCH][2048] flattened
+extern __shared__ int8_t s_mem[]; // [BATCH][SHARED_STRIDE] flattened
 
-__global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
+__global__ void generate_sequence_kernel(
+    const EggModel * __restrict__ model,
+    uint32_t seed,
+    const uint8_t *seed_text,
+    int seed_len,
+    int gen_len,
+    uint8_t *output
+) {
+    int tid = threadIdx.x;
+    // Use 1 block with `HIDDEN_DIM` threads
+    
+    int8_t *s_ptr = s_mem;
+    
+    // Local hidden state (persistent across time steps)
+    int8_t h[N_LAYERS]; 
+    // Init H
+    for(int l=0; l<N_LAYERS; l++) h[l] = 0;
+    
+    int total_len = seed_len + gen_len;
+    uint8_t current_token = 0; 
+    
+    for(int t=0; t < total_len; t++) {
+        if (t < seed_len) current_token = seed_text[t];
+        
+        // 1. Embed
+        if(tid < HIDDEN_DIM) s_ptr[tid] = model->embedding[current_token * HIDDEN_DIM + tid];
+        __syncthreads();
+        
+        // 2. Layers
+        for(int l=0; l<N_LAYERS; l++) {
+             int8_t residual = s_ptr[tid];
+             
+             // LN 1
+             int32_t sum = blockReduceSum(abs((int32_t)s_ptr[tid]));
+             if(!sum) sum=1; int32_t mean = sum/HIDDEN_DIM; if(!mean) mean=1;
+             // Scale
+             s_ptr[tid] = clip(((int32_t)s_ptr[tid] * model->ln_weights[l][0][tid]) / mean);
+             __syncthreads();
+             
+             // GRU Phase 1: calc W0*x -> Buf1, W1*h -> Buf2
+             // Buf1 at HIDDEN_DIM, Buf2 at 2*HIDDEN_DIM
+             // But first save H to Shared (at HIDDEN_DIM) so others can read
+             s_ptr[HIDDEN_DIM + tid] = h[l];
+             __syncthreads();
+             
+             const int8_t *w0 = &model->gru_weights[l][0][0];
+             const int8_t *w1 = &model->gru_weights[l][1][0];
+             int32_t acc0 = 0, acc1 = 0;
+             
+             for(int k=0; k<HIDDEN_DIM; k++) {
+                 acc0 += (int32_t)s_ptr[k] * w0[k*HIDDEN_DIM + tid];
+                 acc1 += (int32_t)s_ptr[HIDDEN_DIM + k] * w1[k*HIDDEN_DIM + tid];
+             }
+             __syncthreads(); // Done reading H
+             s_ptr[HIDDEN_DIM + tid] = acc0 >> 8;
+             s_ptr[2*HIDDEN_DIM + tid] = acc1 >> 8;
+             __syncthreads();
+             
+             // Gates
+             int8_t b1 = s_ptr[HIDDEN_DIM + tid];
+             int8_t b2 = s_ptr[2*HIDDEN_DIM + tid];
+             int8_t ft = clip(b1 + b2 + model->gru_biases[l][0][tid]);
+             
+             // Store Gated to 2*HIDDEN (Buf2)
+             s_ptr[2*HIDDEN_DIM + tid] = (int8_t)(((int32_t)(ft + 127) * h[l]) >> 8);
+             __syncthreads();
+             
+             // GRU Phase 2: W2*x -> Buf1, W3*gated -> Buf3
+             // x at 0, gated at 2*HIDDEN
+             const int8_t *w2 = &model->gru_weights[l][2][0];
+             const int8_t *w3 = &model->gru_weights[l][3][0];
+             
+             acc0 = 0; acc1 = 0;
+             for(int k=0; k<HIDDEN_DIM; k++) {
+                 acc0 += (int32_t)s_ptr[k] * w2[k*HIDDEN_DIM + tid];
+                 acc1 += (int32_t)s_ptr[2*HIDDEN_DIM + k] * w3[k*HIDDEN_DIM + tid];
+             }
+             // Store to Buf1(HIDDEN) and Buf3(3*HIDDEN)
+             __syncthreads(); // Done reading Gated
+             s_ptr[HIDDEN_DIM + tid] = acc0 >> 8;
+             s_ptr[3*HIDDEN_DIM + tid] = acc1 >> 8;
+             __syncthreads(); // Wait for Buf1/Buf3
+             
+             // Update H
+             b1 = s_ptr[HIDDEN_DIM + tid];
+             b2 = s_ptr[3*HIDDEN_DIM + tid];
+             int8_t ht = clip(b1 + b2 + model->gru_biases[l][1][tid]);
+             int32_t diff = ht - h[l];
+             int32_t update = ((int32_t)(ft + 127) * diff) >> 8;
+             h[l] = clip(h[l] + update);
+             
+             // New X (Pre-LN for MLP residual)
+             s_ptr[tid] = clip((int32_t)h[l] + residual);
+             __syncthreads();
+             
+             int8_t mlp_in_resid = s_ptr[tid];
+             
+             // MLP LN
+             sum = blockReduceSum(abs((int32_t)s_ptr[tid]));
+             if(!sum) sum=1; mean = sum/HIDDEN_DIM; if(!mean) mean=1;
+             s_ptr[tid] = clip(((int32_t)s_ptr[tid] * model->ln_weights[l][1][tid]) / mean);
+             __syncthreads();
+             
+             // MLP Expand: HIDDEN->4*HIDDEN.
+             // Each thread computes 4 outputs (4*HIDDEN outputs total).
+             const int8_t *w_exp = &model->mlp_weights[l][0][0];
+             int8_t exp_res[4];
+             for(int i=0; i<4; i++) {
+                 int out_idx = tid + i*HIDDEN_DIM;
+                 int32_t acc = 0;
+                 for(int k=0; k<HIDDEN_DIM; k++) {
+                     acc += (int32_t)s_ptr[k] * w_exp[k*(4*HIDDEN_DIM) + out_idx];
+                 }
+                 exp_res[i] = clip(acc >> 8);
+             }
+             __syncthreads();
+             // Store safely (reuse input 0..4H buffer)
+             for(int i=0; i<4; i++) s_ptr[tid + i*HIDDEN_DIM] = exp_res[i];
+             __syncthreads();
+             
+             // MLP Project: 4*HIDDEN->HIDDEN
+             const int8_t *w_proj = &model->mlp_weights[l][1][0];
+             int32_t acc = 0;
+             for(int k=0; k<(4*HIDDEN_DIM); k++) {
+                 acc += (int32_t)s_ptr[k] * w_proj[k*HIDDEN_DIM + tid];
+             }
+             s_ptr[tid] = clip((acc >> 9) + mlp_in_resid);
+             __syncthreads();
+        }
+        
+        // 3. Head
+        // LN Out
+        int32_t sum = blockReduceSum(abs((int32_t)s_ptr[tid]));
+        if(!sum) sum=1; int32_t mean = sum/HIDDEN_DIM; if(!mean) mean=1;
+        s_ptr[tid] = clip(((int32_t)s_ptr[tid] * model->ln_out[tid]) / mean);
+        __syncthreads();
+        
+        // Logits: HIDDEN->VOCAB
+        // We have HIDDEN threads. VOCAB=256.
+        const int8_t *w_head = &model->head[0];
+        if (tid < VOCAB_SIZE) {
+            int32_t acc = 0;
+            for(int k=0; k<HIDDEN_DIM; k++) {
+                acc += (int32_t)s_ptr[k] * w_head[k*VOCAB_SIZE + tid]; // Transposed map: [Input][Output] -> [k][tid]
+            }
+            // Store at Offset HIDDEN_DIM to separate
+            s_ptr[HIDDEN_DIM + tid] = acc >> 8; 
+        }
+        __syncthreads();
+        
+        // 4. Sample
+        if (t >= seed_len) {
+            // EXP table lookup
+            int32_t val = 0;
+            if (tid < VOCAB_SIZE) {
+                int idx = (int32_t)s_ptr[HIDDEN_DIM + tid] + 128;
+                idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+                val = d_EXP2_TABLE[idx];
+            }
+            int32_t sum_exp = blockReduceSum(val); 
+            
+            uint32_t s = seed + t * 222;
+            uint32_t r_val = hash_rng(s, 0);
+            int32_t r_threshold = (sum_exp > 0) ? (r_val % sum_exp) : 0;
+            
+            if(tid == 0) {
+                int32_t running = 0;
+                int selected = VOCAB_SIZE - 1;
+                // Serial scan
+                for(int i=0; i<VOCAB_SIZE; i++) {
+                    int idx = (int32_t)s_ptr[HIDDEN_DIM + i] + 128;
+                    idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+                    running += d_EXP2_TABLE[idx];
+                    if (running > r_threshold) {
+                        selected = i;
+                        break;
+                    }
+                }
+                current_token = (uint8_t)selected;
+                if (t >= seed_len) output[t - seed_len] = current_token;
+            }
+            // Broadcast token
+            // s_ptr[0] = current_token?
+             if (tid == 0) s_ptr[0] = current_token;
+             __syncthreads();
+             current_token = (uint8_t)s_ptr[0];
+        }
+    }
+}
+
+__global__ void __launch_bounds__(1024) train_sequence_kernel(
     const uint8_t * __restrict__ dataset,
     long data_len,
     int start_idx,
@@ -373,7 +412,7 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
             uint8_t input_token = dataset[stream_pos + t];
             
             if (tid < HIDDEN_DIM) {
-                s_ptr[b * 2048 + tid] = model->embedding[input_token * HIDDEN_DIM + tid];
+                s_ptr[b * SHARED_STRIDE + tid] = model->embedding[input_token * HIDDEN_DIM + tid];
             }
         }
         __syncthreads();
@@ -384,7 +423,7 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
 
             // LN 1
             for(int b=0; b<BATCH; b++) {
-                int8_t *sx_b = &s_ptr[b * 2048];
+                int8_t *sx_b = &s_ptr[b * SHARED_STRIDE];
                 int32_t val = sx_b[tid];
                 gru_resid[b] = (int8_t)val; // Save Pre-LN residual
                 
@@ -395,9 +434,9 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
             }
             __syncthreads();
             
-            // Save H to shared (Offset 512) for MatMul2
+            // Save H to shared (Offset HIDDEN_DIM) for MatMul2
             for(int b=0; b<BATCH; b++) {
-                 if(tid < HIDDEN_DIM) s_ptr[b*2048 + 512 + tid] = h[b][l];
+                 if(tid < HIDDEN_DIM) s_ptr[b*SHARED_STRIDE + HIDDEN_DIM + tid] = h[b][l];
             }
             __syncthreads();
 
@@ -412,11 +451,11 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                 
                 // M1 (In=x)
                 int8_t b1 = noise_from_hash(seed + 1 + HIDDEN_DIM, tid);
-                xB_m1[b] = blockReduceSum((int32_t)s_ptr[b*2048+tid] * b1);
+                xB_m1[b] = blockReduceSum((int32_t)s_ptr[b*SHARED_STRIDE+tid] * b1);
                 
                 // M2 (In=h)
                 int8_t b2 = noise_from_hash(seed + 2 + HIDDEN_DIM, tid);
-                xB_m2[b] = blockReduceSum((int32_t)s_ptr[b*2048+512+tid] * b2);
+                xB_m2[b] = blockReduceSum((int32_t)s_ptr[b*SHARED_STRIDE+HIDDEN_DIM+tid] * b2);
             }
 
             // MatMul 1 & 2 (Fused Loop)
@@ -430,8 +469,8 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                 int8_t v1 = w1[k*HIDDEN_DIM + tid];
                 int8_t v2 = w2[k*HIDDEN_DIM + tid];
                 for(int b=0; b<BATCH; b++) {
-                    dot1[b] += (int32_t)s_ptr[b*2048 + k] * v1;
-                    dot2[b] += (int32_t)s_ptr[b*2048 + 512 + k] * v2;
+                    dot1[b] += (int32_t)s_ptr[b*SHARED_STRIDE + k] * v1;
+                    dot2[b] += (int32_t)s_ptr[b*SHARED_STRIDE + HIDDEN_DIM + k] * v2;
                 }
             }
             
@@ -456,10 +495,10 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                  gated_reg[b] = (int8_t)(((int32_t)(ft_reg[b] + 127) * h[b][l]) >> 8);
             }
             
-            // Save Gated to Shared (Offset 1024) for M4
+            // Save Gated to Shared (Offset 2*HIDDEN_DIM) for M4
             __syncthreads();
             for(int b=0; b<BATCH; b++) {
-                if(tid < HIDDEN_DIM) s_ptr[b*2048 + 1024 + tid] = gated_reg[b];
+                if(tid < HIDDEN_DIM) s_ptr[b*SHARED_STRIDE + 2*HIDDEN_DIM + tid] = gated_reg[b];
             }
             __syncthreads();
             
@@ -471,11 +510,11 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                 
                 // M3 (In=x)
                 int8_t b3 = noise_from_hash(seed + 3 + HIDDEN_DIM, tid);
-                xB_m3[b] = blockReduceSum((int32_t)s_ptr[b*2048+tid] * b3);
+                xB_m3[b] = blockReduceSum((int32_t)s_ptr[b*SHARED_STRIDE+tid] * b3);
                 
                 // M4 (In=gated)
                 int8_t b4 = noise_from_hash(seed + 4 + HIDDEN_DIM, tid);
-                xB_m4[b] = blockReduceSum((int32_t)s_ptr[b*2048+1024+tid] * b4);
+                xB_m4[b] = blockReduceSum((int32_t)s_ptr[b*SHARED_STRIDE + 2*HIDDEN_DIM + tid] * b4);
             }
             
             for(int b=0; b<BATCH; b++) { dot1[b]=0; dot2[b]=0; } // reuse regs
@@ -486,8 +525,8 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                 int8_t v3 = w3[k*HIDDEN_DIM + tid];
                 int8_t v4 = w4[k*HIDDEN_DIM + tid];
                 for(int b=0; b<BATCH; b++) {
-                    dot1[b] += (int32_t)s_ptr[b*2048 + k] * v3;
-                    dot2[b] += (int32_t)s_ptr[b*2048 + 1024 + k] * v4;
+                    dot1[b] += (int32_t)s_ptr[b*SHARED_STRIDE + k] * v3;
+                    dot2[b] += (int32_t)s_ptr[b*SHARED_STRIDE + 2*HIDDEN_DIM + k] * v4;
                 }
             }
             
@@ -515,25 +554,25 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
             for(int b=0; b<BATCH; b++) {
                 // Use stored Pre-LN residual
                 int8_t new_x = clip((int32_t)h[b][l] + gru_resid[b]); 
-                s_ptr[b*2048 + tid] = new_x; // Update s_x for MLP
+                s_ptr[b*SHARED_STRIDE + tid] = new_x; // Update s_x for MLP
             }
             __syncthreads(); 
             
             // Save Pre-LN Residual for MLP
             int8_t mlp_resid[BATCH];
-            for(int b=0; b<BATCH; b++) mlp_resid[b] = s_ptr[b*2048 + tid];
+            for(int b=0; b<BATCH; b++) mlp_resid[b] = s_ptr[b*SHARED_STRIDE + tid];
 
             // MLP LN 2
             for(int b=0; b<BATCH; b++) {
-                int32_t val = s_ptr[b*2048 + tid];
+                int32_t val = s_ptr[b*SHARED_STRIDE + tid];
                 int32_t sum = blockReduceSum(abs(val));
                 if(!sum) sum=1; int32_t mean = sum/HIDDEN_DIM; if(!mean) mean=1;
                 val = clip(((int32_t)val * model->ln_weights[l][1][tid]) / mean);
-                s_ptr[b*2048 + tid] = val;
+                s_ptr[b*SHARED_STRIDE + tid] = val;
             }
             __syncthreads(); 
 
-            // MLP Expand (512 -> 2048)
+            // MLP Expand (HIDDEN -> 4*HIDDEN)
             int8_t mlp_res[BATCH][4];
             
             // 1. Rank-1 xB for MLP1
@@ -542,8 +581,8 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                  int p_idx = block_p_idx * BATCH + b;
                  int pair_idx = p_idx / 2;
                  uint32_t seed = (step_seed+pair_idx) + (l * 100) + 5;
-                 int8_t b_val = noise_from_hash(seed + 2048, tid); // Offset A size 2048
-                 xB_mlp1[b] = blockReduceSum((int32_t)s_ptr[b*2048+tid] * b_val);
+                 int8_t b_val = noise_from_hash(seed + SHARED_STRIDE, tid); // Offset A
+                 xB_mlp1[b] = blockReduceSum((int32_t)s_ptr[b*SHARED_STRIDE+tid] * b_val);
             }
             
             // 2. Init accums
@@ -553,11 +592,11 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
             const int8_t *w_mlp1 = &model->mlp_weights[l][0][0];
              for(int k=0; k<HIDDEN_DIM; k++) {
                  for(int sub=0; sub<4; sub++) {
-                      // Access: W[k * 2048 + (tid + sub*512)]
+                      // Access: W[k * (4*HIDDEN) + (tid + sub*HIDDEN)]
                       int out_idx = tid + sub * HIDDEN_DIM;
-                      int8_t w_val = w_mlp1[k*2048 + out_idx];
+                      int8_t w_val = w_mlp1[k*(HIDDEN_DIM*4) + out_idx];
                       for(int b=0; b<BATCH; b++) {
-                          acc_mlp[b][sub] += (int32_t)s_ptr[b*2048 + k] * w_val;
+                          acc_mlp[b][sub] += (int32_t)s_ptr[b*SHARED_STRIDE + k] * w_val;
                       }
                  }
              }
@@ -577,18 +616,18 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                  }
              }
              
-             // MLP Project (2048 -> 512)
+             // MLP Project (4*HIDDEN -> HIDDEN)
              // Input is `mlp_res` (Distributed).
              // We MUST write to Shared to broadcast for next MatMul.
              __syncthreads();
              for(int b=0; b<BATCH; b++) {
                  for(int sub=0; sub<4; sub++) {
-                     s_ptr[b*2048 + tid + sub*HIDDEN_DIM] = mlp_res[b][sub];
+                     s_ptr[b*SHARED_STRIDE + tid + sub*HIDDEN_DIM] = mlp_res[b][sub];
                  }
              }
              __syncthreads();
              
-             // xB for M2 (Input 2048)
+             // xB for M2 (Input 4*HIDDEN)
              int32_t xB_mlp2[BATCH];
              for(int b=0; b<BATCH; b++) {
                  int p_idx = block_p_idx * BATCH + b;
@@ -598,19 +637,19 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                  int32_t local_sum = 0;
                  for(int sub=0; sub<4; sub++) {
                      int in_idx = tid + sub*HIDDEN_DIM;
-                     int8_t b_val = noise_from_hash(seed + 512, in_idx); // Offset B=512
-                     local_sum += (int32_t)s_ptr[b*2048 + in_idx] * b_val;
+                     int8_t b_val = noise_from_hash(seed + HIDDEN_DIM, in_idx); // Offset B=HIDDEN
+                     local_sum += (int32_t)s_ptr[b*SHARED_STRIDE + in_idx] * b_val;
                  }
                  xB_mlp2[b] = blockReduceSum(local_sum);
              }
              
              int32_t acc_proj[BATCH]; for(int b=0; b<BATCH; b++) acc_proj[b] = 0;
              const int8_t *w_mlp2 = &model->mlp_weights[l][1][0];
-             // K=2048. Loop 2048.
-             for(int k=0; k<2048; k++) {
+             // K=4*HIDDEN. Loop
+             for(int k=0; k<HIDDEN_DIM*4; k++) {
                  int8_t w_val = w_mlp2[k*HIDDEN_DIM + tid];
                  for(int b=0; b<BATCH; b++) {
-                     acc_proj[b] += (int32_t)s_ptr[b*2048 + k] * w_val;
+                     acc_proj[b] += (int32_t)s_ptr[b*SHARED_STRIDE + k] * w_val;
                  }
              }
 
@@ -625,7 +664,7 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
                  if(ns!=0) acc_proj[b] += ((xB_mlp2[b] * (int32_t)a_val) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
                  
                  int32_t res = acc_proj[b] >> 9; // Shift 9 for MLP project
-                 s_ptr[b*2048 + tid] = clip(res + mlp_resid[b]);
+                 s_ptr[b*SHARED_STRIDE + tid] = clip(res + mlp_resid[b]);
              }
              __syncthreads();
          
@@ -633,10 +672,10 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
         
         // 3. Head LN
         for(int b=0; b<BATCH; b++) {
-            int32_t val = s_ptr[b * 2048 + tid];
+            int32_t val = s_ptr[b * SHARED_STRIDE + tid];
             int32_t sum = blockReduceSum(abs(val));
             if(!sum) sum=1; int32_t mean = sum/HIDDEN_DIM; if(!mean) mean=1;
-            s_ptr[b * 2048 + tid] = clip(((int32_t)val * model->ln_out[tid]) / mean);
+            s_ptr[b * SHARED_STRIDE + tid] = clip(((int32_t)val * model->ln_out[tid]) / mean);
         }
         __syncthreads();
         
@@ -649,7 +688,7 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
              int pair_idx = p_idx / 2;
              uint32_t seed = (step_seed+pair_idx) + 999;
              int8_t b_val = noise_from_hash(seed + VOCAB_SIZE, tid); // B off 256
-             xB_head[b] = blockReduceSum((int32_t)s_ptr[b*2048+tid] * b_val);
+             xB_head[b] = blockReduceSum((int32_t)s_ptr[b*SHARED_STRIDE+tid] * b_val);
          }
          
          const int8_t *w_head = &model->head[0];
@@ -658,7 +697,7 @@ __global__ void __launch_bounds__(HIDDEN_DIM) train_sequence_kernel(
              
             for(int k=0; k<HIDDEN_DIM; k++) {
                 int8_t w = w_head[k*VOCAB_SIZE + tid];
-                for(int b=0; b<BATCH; b++) acc[b] += (int32_t)s_ptr[b*2048 + k] * w;
+                for(int b=0; b<BATCH; b++) acc[b] += (int32_t)s_ptr[b*SHARED_STRIDE + k] * w;
             }
             
             for(int b=0; b<BATCH; b++) {
@@ -834,7 +873,7 @@ int main() {
         
         // 1. Forward Pass (Population)
         // Grid: POP_SIZE/BATCH (2 blocks if POP=16, BATCH=8)
-        train_sequence_kernel<<<POPULATION_SIZE / BATCH, HIDDEN_DIM, BATCH * 2048>>>(
+        train_sequence_kernel<<<POPULATION_SIZE / BATCH, HIDDEN_DIM, BATCH * SHARED_STRIDE>>>(
             d_dataset, ds.length, start_idx, d_model, d_pop_states, d_accum_loss, seed
         );
         cudaDeviceSynchronize();
@@ -863,44 +902,81 @@ int main() {
         CHECK_CUDA(cudaMemcpyToSymbol(d_debug_updates, zeros, 2*sizeof(int32_t)));
 
         // 3. Update Weights (Kernels)
+        dim3 block(512);
         for(int l=0; l<N_LAYERS; l++) {
              int seed_base = l * 100;
              // GRU 0..3
              size_t gru_size = HIDDEN_DIM * HIDDEN_DIM * sizeof(int8_t);
              long off_g = offsetof(EggModel, gru_weights) + (l * 4 * HIDDEN_DIM * HIDDEN_DIM);
              
-             update_matrix_kernel<<< (HIDDEN_DIM*HIDDEN_DIM + 511)/512, 512 >>>(
+             int gru_elems = HIDDEN_DIM*HIDDEN_DIM;
+             update_matrix_kernel<<< (gru_elems + 511)/512, 512 >>>(
                  (int8_t*)d_model + off_g + 0*gru_size, HIDDEN_DIM, HIDDEN_DIM, 1, 1+HIDDEN_DIM, seed_base, d_fitnesses, seed
              );
-             update_matrix_kernel<<< (HIDDEN_DIM*HIDDEN_DIM + 511)/512, 512 >>>(
+             update_matrix_kernel<<< (gru_elems + 511)/512, 512 >>>(
                  (int8_t*)d_model + off_g + 1*gru_size, HIDDEN_DIM, HIDDEN_DIM, 2, 2+HIDDEN_DIM, seed_base, d_fitnesses, seed
              );
-             update_matrix_kernel<<< (HIDDEN_DIM*HIDDEN_DIM + 511)/512, 512 >>>(
+             update_matrix_kernel<<< (gru_elems + 511)/512, 512 >>>(
                  (int8_t*)d_model + off_g + 2*gru_size, HIDDEN_DIM, HIDDEN_DIM, 3, 3+HIDDEN_DIM, seed_base, d_fitnesses, seed
              );
-             update_matrix_kernel<<< (HIDDEN_DIM*HIDDEN_DIM + 511)/512, 512 >>>(
+             update_matrix_kernel<<< (gru_elems + 511)/512, 512 >>>(
                  (int8_t*)d_model + off_g + 3*gru_size, HIDDEN_DIM, HIDDEN_DIM, 4, 4+HIDDEN_DIM, seed_base, d_fitnesses, seed
              );
              
              size_t mlp_exp_size = HIDDEN_DIM * (HIDDEN_DIM*4) * sizeof(int8_t);
              long off_m = offsetof(EggModel, mlp_weights) + (l * 2 * mlp_exp_size);
              
-             // MLP 1 (Expand): 2048x512. A_off=0, B_off=2048. Seed=Base+5.
-             update_matrix_kernel<<< (2048*512 + 511)/512, 512 >>>(
-                 (int8_t*)d_model + off_m + 0, 2048, 512, 0, 2048, seed_base+5, d_fitnesses, seed
+             int exp_rows = 4*HIDDEN_DIM;
+             int exp_cols = HIDDEN_DIM;
+             // MLP 1 (Expand): rows=4*H, cols=H (stored [H][4H] but transpose logic says [4H][H]?? Check logic)
+             // Note: W is [Input][Output]. Input=H, Output=4H. Memory: [Input * Output].
+             // Thread Indexing x: c * rows + r. c=Input, r=Output.
+             // So Input=H, Output=4H. rows=4*H (output), cols=H (input).
+             // Offset A (for r): 0? 
+             // Code used A_off=0, B_off=2048 (4H). A is 512 (H)?
+             // Wait, original: `update_matrix_kernel...(..., 2048, 512, ...)`
+             // Rows=2048, Cols=512. 
+             // Output=2048. Input=512. Correct.
+             // Offsets: A=0, B=2048. A maps to r(0..2047)? B maps to c(0..511)?
+             // A is `noise_from_hash(s + offset_A, r)`. If r up to 2048, A needs to cover 2048.
+             // B is `noise_from_hash(s + offset_B, c)`. If c up to 512, B needs to cover 512.
+             // Original used A_off=0, B_off=2048.
+             // In `train`, MLP1 uses `seed + 2048` for B (Input). `seed` for A (Output).
+             // Wait, train: `xB_mlp1` (In) uses `noise(seed + 2048, tid)`. `tid` is input dim index.
+             // `noise_store` (Out) uses `noise(seed, out_idx)`.
+             // So Input corresponds to offset 2048. Output to offset 0.
+             // In `update`:
+             // `int8_t a = noise_from_hash(s + offset_A, r);` r is Output. Needs offset 0.
+             // `int8_t b = noise_from_hash(s + offset_B, c);` c is Input. Needs offset 2048 (SHARED_STRIDE?)
+             // Yes. offset_B was 2048 (4H). offset_A was 0.
+             // Wait, `SHARED_STRIDE` is `4*HIDDEN`.
+             // I should use `SHARED_STRIDE` for B offset.
+             
+             update_matrix_kernel<<< (exp_rows*exp_cols + 511)/512, 512 >>>(
+                 (int8_t*)d_model + off_m + 0, exp_rows, exp_cols, 0, SHARED_STRIDE, seed_base+5, d_fitnesses, seed
              );
              
-             // MLP 2 (Project): 512x2048. A_off=0, B_off=512. Seed=Base+6.
-             update_matrix_kernel<<< (512*2048 + 511)/512, 512 >>>(
-                 (int8_t*)d_model + off_m + mlp_exp_size, 512, 2048, 0, 512, seed_base+6, d_fitnesses, seed
+             // MLP 2 (Project): Input=4H, Output=H.
+             // Rows=H (512), Cols=4H (2048).
+             // Offsets: A (Output H) = 0? 
+             // Train: `xB_mlp2` (Input 4H) uses `seed + 512` (HIDDEN).
+             // `acc_proj` (Output H) uses `seed`.
+             // So Output offset = 0. Input offset = HIDDEN.
+             // Update: A (r=Output) -> 0. B (c=Input) -> HIDDEN.
+             
+             update_matrix_kernel<<< (HIDDEN_DIM*(4*HIDDEN_DIM) + 511)/512, 512 >>>(
+                 (int8_t*)d_model + off_m + mlp_exp_size, HIDDEN_DIM, 4*HIDDEN_DIM, 0, HIDDEN_DIM, seed_base+6, d_fitnesses, seed
              );
         }
         
         // Head
-        // Weights: [512][256]. A_off=0, B_off=256. Seed=999.
+        // Weights: [H][V]. Input H, Output V.
+        // Rows=V (256), Cols=H (512).
+        // Offsets: Train Head uses `seed + VOCAB` for Input (H). `seed` for Output (V).
+        // Update: A (Output V) -> 0. B (Input H) -> VOCAB.
         long off_head = offsetof(EggModel, head);
-        update_matrix_kernel<<< (256*512 + 511)/512, 512 >>>(
-            (int8_t*)d_model + off_head, 256, 512, 0, 256, 999, d_fitnesses, seed
+        update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM + 511)/512, 512 >>>(
+            (int8_t*)d_model + off_head, VOCAB_SIZE, HIDDEN_DIM, 0, VOCAB_SIZE, 999, d_fitnesses, seed
         );
         cudaDeviceSynchronize();
 
@@ -909,52 +985,60 @@ int main() {
         double t = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec)/1e9;
         total_tokens += POPULATION_SIZE * SEQ_LEN;
         
-        if (step % 1 == 0) {
+        if (step % 1 == 0) { // Reporting Frequency
             int32_t h_updates[2];
             CHECK_CUDA(cudaMemcpyFromSymbol(h_updates, d_debug_updates, 2*sizeof(int32_t), 0, cudaMemcpyDeviceToHost));
             
-            // Measure Model Transfer
-            struct timespec t_tr_start, t_tr_end;
-            clock_gettime(CLOCK_MONOTONIC, &t_tr_start);
-            
-            CHECK_CUDA(cudaMemcpy(h_model, d_model, sizeof(EggModel), cudaMemcpyDeviceToHost));
-            
-            clock_gettime(CLOCK_MONOTONIC, &t_tr_end);
-            double transfer_ms = ((t_tr_end.tv_sec - t_tr_start.tv_sec) * 1000.0) + 
-                                 ((t_tr_end.tv_nsec - t_tr_start.tv_nsec) / 1e6);
-            double transfer_mb = (double)sizeof(EggModel) / (1024.0 * 1024.0);
-
-            // Weight Stats
-            double w_sum = 0;
-            long w_count = HIDDEN_DIM * HIDDEN_DIM;
-            for(int i=0; i<w_count; i++) w_sum += abs(h_model->gru_weights[0][0][i]);
-            double w_mean = w_sum / w_count;
-
-            double sample_ms = 0.0;
-            if (step % 1 == 0) {
-               // Sampling
-               struct timespec t_samp_start, t_samp_end;
-               clock_gettime(CLOCK_MONOTONIC, &t_samp_start);
-               
-               sample_model_host(h_model, &ds.data[start_idx], 30, 50);
-               
-               clock_gettime(CLOCK_MONOTONIC, &t_samp_end);
-               sample_ms = ((t_samp_end.tv_sec - t_samp_start.tv_sec) * 1000.0) + 
-                           ((t_samp_end.tv_nsec - t_samp_start.tv_nsec) / 1e6);
+            // --- GPU Sampling ---
+            static uint8_t *d_output = NULL;
+            static uint8_t *h_output = NULL;
+            int seed_len = 30; 
+            int gen_len = 50;
+            if(!d_output) {
+                CHECK_CUDA(cudaMalloc(&d_output, gen_len));
+                h_output = (uint8_t*)malloc(gen_len);
             }
             
+            struct timespec t_samp_start, t_samp_end;
+            clock_gettime(CLOCK_MONOTONIC, &t_samp_start);
+            
+            // Launch 1 block, HIDDEN_DIM threads
+            // IMPORTANT: d_accum_loss is just a convenient checked ptr, but we need to pass outputs
+            // generate_sequence_kernel<<<1, HIDDEN_DIM, 5 * HIDDEN_DIM * sizeof(int8_t)>>>(...);
+            // But use 5*HIDDEN_DIM bytes shared memory.
+            
+            generate_sequence_kernel<<<1, HIDDEN_DIM, 5 * HIDDEN_DIM * sizeof(int8_t)>>>(
+                d_model, seed + 12345, d_dataset + start_idx, seed_len, gen_len, d_output
+            );
+            CHECK_CUDA(cudaDeviceSynchronize()); 
+            CHECK_CUDA(cudaMemcpy(h_output, d_output, gen_len, cudaMemcpyDeviceToHost));
+            
+            clock_gettime(CLOCK_MONOTONIC, &t_samp_end);
+            double sample_ms = ((t_samp_end.tv_sec - t_samp_start.tv_sec) * 1000.0) + 
+                               ((t_samp_end.tv_nsec - t_samp_start.tv_nsec) / 1e6);
+            
+            // Print result
+            printf("\033[32m");
+            for(int i=0; i<seed_len; i++) {
+                char c = ds.data[start_idx+i];
+                if(c>=32 && c<=126) printf("%c", c); else printf(".");
+            }
+            printf("\033[36m");
+            for(int i=0; i<gen_len; i++) {
+                char c = h_output[i];
+                if(c>=32 && c<=126) printf("%c", c); else printf(".");
+            }
+            printf("\033[0m\n");
+
             double avg_loss = 0;
             for(int i=0; i<POPULATION_SIZE; i++) avg_loss += h_accum_loss[i];
             avg_loss /= (double)(POPULATION_SIZE); 
             double loss_per_token = avg_loss / (SEQ_LEN * (1 << FIXED_POINT));
             
-            printf("\nStep %ld | Loss: %.4f | Up+: %d Up-: %d | W_Mean: %.4f | Tok/s: %.2f\n", 
-               step, loss_per_token, h_updates[0], h_updates[1], w_mean, (double)(POPULATION_SIZE * SEQ_LEN * 1) / t); 
-            
-            printf("[Transfer: %.2f MB in %.2f ms] [CPU Sample: %.2f ms]\n", 
-                   transfer_mb, transfer_ms, sample_ms);
-
-            clock_gettime(CLOCK_MONOTONIC, &start); 
+            printf("\nStep %ld | Loss: %.4f | Up+: %d Up-: %d | GPU Sample: %.2f ms | Tok/s: %.2f\n", 
+               step, loss_per_token, h_updates[0], h_updates[1], sample_ms,  total_tokens / t); 
+               
+            //clock_gettime(CLOCK_MONOTONIC, &start); 
         }
     }
     return 0;
