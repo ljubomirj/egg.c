@@ -17,15 +17,15 @@ void handle_sigint(int sig) {
 }
 
 // --- Configuration ---
-#define SM_CORES 128
+#define SM_CORES 128*2
 #define WARP_SIZE 32
 #define BLOCK_THREADS 256
 #define BATCH WARP_SIZE
 #define VOCAB_SIZE 256
-#define HIDDEN_DIM (SM_CORES * 1)
+#define HIDDEN_DIM (SM_CORES * 1) 
 #define N_LAYERS 4
 #define SEQ_LEN 256
-#define POPULATION_SIZE (SM_CORES * 512*1)
+#define POPULATION_SIZE (SM_CORES * 512/4)
 #define SHARED_STRIDE (HIDDEN_DIM * 4)
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 4
@@ -79,7 +79,7 @@ typedef struct {
 } EggModel;
 
 // Global Tables
-__device__ int32_t d_EXP2_TABLE[256];
+__constant__ int32_t d_EXP2_TABLE[256];
 int32_t h_EXP2_TABLE[256];
 
 __device__ int32_t d_debug_updates[2]; // 0: Inc, 1: Dec
@@ -94,7 +94,7 @@ int get_update_threshold(double loss) {
     if (loss > 4.0) return 5000;
     if (loss > 3.8) return 30000;
     if (loss > 3.6) return 60000;
-    if (loss > 3.5) return 130000; // ~69000 * 4
+    //if (loss > 3.5) return 130000; // ~69000 * 4
     if (loss > 1.0) return 270000;
     return 400000; 
 }
@@ -505,7 +505,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
                 long long perturb = ((long long)a * ns) >> SIGMA_SHIFT_VECTOR;
                 my_s_ptr[i] = clip(((long long)my_s_ptr[i] * (w + perturb)) / mean);
             }
-            __syncwarp();
+            // Merge Sync: LN1 and CopyH act on disjoint memory, sync after both.
             
             // Copy H to Shared (Buf 1)
             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
@@ -658,7 +658,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
                       mlp_res[i / WARP_SIZE][sub] = clip(acc_mlp >> 8);
                  }
              }
-             __syncwarp();
+             // Removed Redundant Sync (Register to Register only here)
              
              // Write Expand to Shared
              for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
