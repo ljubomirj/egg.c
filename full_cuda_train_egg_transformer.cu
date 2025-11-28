@@ -25,10 +25,10 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 256
+#define HIDDEN_DIM 384
 #define HEAD_DIM 64
 #define N_LAYERS 4
-#define SEQ_LEN 512     
+#define SEQ_LEN 128     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
 #define MAX_BLOCK_THREADS 1024 
@@ -40,8 +40,8 @@ void handle_sigint(int sig) {
 #define POPULATION_SIZE 8192 * 2
 
 #define FIXED_POINT 4
-#define SIGMA_SHIFT 4
-#define SIGMA_SHIFT_VECTOR (SIGMA_SHIFT - 2)
+#define SIGMA_SHIFT 0
+#define SIGMA_SHIFT_VECTOR 2
 #define MAX_VAL 127
 #define MIN_VAL -127
 
@@ -93,12 +93,12 @@ __device__ unsigned long long d_total_updates;
 // --- HOST HELPER ---
 int get_update_threshold(double loss) {
     if (loss > 6.0) return 100;
-    if (loss > 5.0) return 1000;
-    if (loss > 4.8) return 2000;
-    if (loss > 4.4) return 4000;
-    if (loss > 4.25) return 8000;
-    if (loss > 4.2) return 16000;
-    if (loss > 4.0) return 20000;
+    if (loss > 4.0) return 100;
+    if (loss > 3.7) return 2000;
+    if (loss > 3.4) return 4000;
+    if (loss > 3.25) return 8000;
+    if (loss > 3.2) return 16000;
+    if (loss > 3.0) return 20000;
     if (loss > 1.0) return 20000;
     return 20000; 
 }
@@ -142,7 +142,10 @@ void init_model(TransformerModel *model) {
     free(temp);
 }
 
-// --- DEVICE KERNELS ---
+// --- DEVICE KERNELS & HELPERS ---
+
+typedef cub::BlockReduce<long long, BLOCK_THREADS> BlockReduce;
+
 __device__ __forceinline__ uint32_t hash_rng(uint32_t s, uint32_t idx) {
     uint32_t x = s + idx * 0x9e3779b9u; x ^= x >> 16; x *= 0x85ebca6b; x ^= x >> 13; x *= 0xc2b2ae35; x ^= x >> 16; return x;
 }
@@ -151,7 +154,13 @@ __device__ __forceinline__ int8_t noise_from_hash(uint32_t s, uint32_t idx) {
 }
 __device__ __forceinline__ int8_t clip(long long a) { return (a > MAX_VAL) ? MAX_VAL : ((a < MIN_VAL) ? MIN_VAL : (int8_t)a); }
 
-extern __shared__ int8_t s_mem[]; 
+// Helper: Sum reduction + Broadcast
+__device__ __forceinline__ long long block_reduce_sum_broadcast(long long val, BlockReduce::TempStorage &storage, long long &shared_var) {
+    long long total = BlockReduce(storage).Sum(val);
+    if (threadIdx.x == 0) shared_var = total;
+    __syncthreads();
+    return shared_var;
+}
 
 __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     const uint8_t * __restrict__ dataset, long data_len, int start_idx,
@@ -164,8 +173,8 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     int tid = threadIdx.x;
     if (tid >= HIDDEN_DIM) return;
 
+    extern __shared__ int8_t s_mem[];
     int8_t *s_x = s_mem; 
-    typedef cub::BlockReduce<long long, BLOCK_THREADS> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
     __shared__ long long shared_scalar;
 
@@ -197,24 +206,17 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             int8_t *s_norm = &s_mem[HIDDEN_DIM]; // Normalized buf
 
             // LN 1
-            long long local_sum = abs(s_x[tid]);
-            long long total_sum = BlockReduce(temp_storage).Sum(local_sum);
-            if (tid == 0) shared_scalar = total_sum; __syncthreads();
-            long long mean = shared_scalar / HIDDEN_DIM; if(!mean) mean=1;
+            long long total_sum = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+            long long mean = total_sum / HIDDEN_DIM; if(!mean) mean=1;
             int8_t ln_w = model->ln_1[l][tid];
             int8_t ln_n = noise_from_hash(seed_base + SEED_OFF_LN_1, tid);
             int8_t r_in = clip(((long long)s_x[tid] * (ln_w + (((long long)ln_n * ns) >> SIGMA_SHIFT_VECTOR))) / mean);
             s_norm[tid] = r_in; __syncthreads();
 
             // QKV Projection (Rank-1 Fast)
-            long long pbq = (long long)r_in * noise_from_hash(seed_base + SEED_OFF_Q_B, tid);
-            long long sbq = BlockReduce(temp_storage).Sum(pbq); if(tid==0) shared_scalar=sbq; __syncthreads(); sbq=shared_scalar;
-            
-            long long pbk = (long long)r_in * noise_from_hash(seed_base + SEED_OFF_K_B, tid);
-            long long sbk = BlockReduce(temp_storage).Sum(pbk); if(tid==0) shared_scalar=sbk; __syncthreads(); sbk=shared_scalar;
-            
-            long long pbv = (long long)r_in * noise_from_hash(seed_base + SEED_OFF_V_B, tid);
-            long long sbv = BlockReduce(temp_storage).Sum(pbv); if(tid==0) shared_scalar=sbv; __syncthreads(); sbv=shared_scalar;
+            long long sbq = block_reduce_sum_broadcast((long long)r_in * noise_from_hash(seed_base + SEED_OFF_Q_B, tid), temp_storage, shared_scalar);
+            long long sbk = block_reduce_sum_broadcast((long long)r_in * noise_from_hash(seed_base + SEED_OFF_K_B, tid), temp_storage, shared_scalar);
+            long long sbv = block_reduce_sum_broadcast((long long)r_in * noise_from_hash(seed_base + SEED_OFF_V_B, tid), temp_storage, shared_scalar);
 
             long long aq=0, ak=0, av=0;
             const int8_t *wq = &model->w_q[l][0];
@@ -255,7 +257,6 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                  
                  // Reduce across head (Head Size 64, Warp 32)
                  // Need shuffle to reduce 64 to 1.
-                 // tid 0..31 (Part1), tid 32..63 (Part2)
                  for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
                  
                  // Lane 0 of each warp has a partial sum for that warp's head-part.
@@ -279,8 +280,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             s_norm[tid] = ao; __syncthreads();
 
             // Output Proj
-            long long pbo = (long long)ao * noise_from_hash(seed_base + SEED_OFF_O_B, tid);
-            long long sbo = BlockReduce(temp_storage).Sum(pbo); if(tid==0) shared_scalar=sbo; __syncthreads(); sbo=shared_scalar;
+            long long sbo = block_reduce_sum_broadcast((long long)ao * noise_from_hash(seed_base + SEED_OFF_O_B, tid), temp_storage, shared_scalar);
 
             const int8_t *wo = &model->w_o[l][0];
             long long aco = 0;
@@ -290,21 +290,17 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
             // MLP Block
             // Norm 2
-            long long msum = abs(s_x[tid]);
-            long long mtot = BlockReduce(temp_storage).Sum(msum); if(tid==0) shared_scalar=mtot; __syncthreads();
-            long long mmn = shared_scalar/HIDDEN_DIM; if(!mmn) mmn=1;
+            long long mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+            long long mmn = mtot/HIDDEN_DIM; if(!mmn) mmn=1;
             int8_t l2w = model->ln_2[l][tid];
             int8_t l2n = noise_from_hash(seed_base + SEED_OFF_LN_2, tid);
             int8_t n2x = clip(((long long)s_x[tid] * (l2w + (((long long)l2n*ns)>>SIGMA_SHIFT_VECTOR))) / mmn);
             s_norm[tid] = n2x; __syncthreads();
 
             // Expand
-            long long pbup = (long long)n2x * noise_from_hash(seed_base + SEED_OFF_MLP_UP_B, tid);
-            long long sbup = BlockReduce(temp_storage).Sum(pbup); if(tid==0) shared_scalar=sbup; __syncthreads(); sbup=shared_scalar;
+            long long sbup = block_reduce_sum_broadcast((long long)n2x * noise_from_hash(seed_base + SEED_OFF_MLP_UP_B, tid), temp_storage, shared_scalar);
 
-            int8_t *s_mlp = &s_mem[2*HIDDEN_DIM + 256]; // Storage for huge activation? Wait.
-            // HIDDEN=768. MLP=3072. 3KB. Fits in Shared (48KB typically).
-            // Offset: 2*768 (1.5K) + 256 (Scores) = ~1.8K. +3K = 4.8K. Safe.
+            int8_t *s_mlp = &s_mem[2*HIDDEN_DIM + 256]; 
 
             const int8_t *wup = &model->w_up[l][0];
             // Need to compute 4x output dims. Loop.
@@ -314,10 +310,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 for(int k=0; k<HIDDEN_DIM; k++) aup += (long long)s_norm[k] * wup[k*(4*HIDDEN_DIM) + oidx];
                 if(ns!=0) aup += ((sbup * (long long)noise_from_hash(seed_base + SEED_OFF_MLP_UP_A, oidx)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
                 int8_t v = clip(aup>>8); if(v<0) v=0; // ReLU
-                s_mlp[oidx] = v; // Requires synchronization if reused across threads?
-                // Each thread computes its own 'oidx' slices? 
-                // No. Thread tid computes out [tid, tid+H, tid+2H...].
-                // 's_mlp' is a shared buffer.
+                s_mlp[oidx] = v; 
             }
             __syncthreads();
 
@@ -326,7 +319,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             // Need scalar B projection of s_mlp.
             long long pbdn = 0;
             for(int sub=0; sub<4; sub++) pbdn += (long long)s_mlp[tid + sub*HIDDEN_DIM] * noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_B, tid + sub*HIDDEN_DIM);
-            long long sbdn = BlockReduce(temp_storage).Sum(pbdn); if(tid==0) shared_scalar=sbdn; __syncthreads(); sbdn=shared_scalar;
+            long long sbdn = block_reduce_sum_broadcast(pbdn, temp_storage, shared_scalar);
 
             const int8_t *wdn = &model->w_down[l][0];
             long long adn = 0;
@@ -336,9 +329,8 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         }
 
         // 3. Final Head
-        long long fsum = abs(s_x[tid]);
-        long long ftot = BlockReduce(temp_storage).Sum(fsum); if(tid==0) shared_scalar=ftot; __syncthreads();
-        long long fmn = shared_scalar/HIDDEN_DIM; if(!fmn) fmn=1;
+        long long ftot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+        long long fmn = ftot/HIDDEN_DIM; if(!fmn) fmn=1;
         
         int8_t lfw = model->ln_f[tid];
         int8_t lfn = noise_from_hash(step_seed + pair_idx + SEED_OFF_LN_F, tid);
@@ -348,8 +340,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         int8_t *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
 
-        long long pbh = (long long)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_HEAD + VOCAB_SIZE, tid);
-        long long sbh = BlockReduce(temp_storage).Sum(pbh); if(tid==0) shared_scalar=sbh; __syncthreads(); sbh=shared_scalar;
+        long long sbh = block_reduce_sum_broadcast((long long)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_HEAD + VOCAB_SIZE, tid), temp_storage, shared_scalar);
 
         // Compute Logits (only first VOCAB_SIZE threads)
         if(tid < VOCAB_SIZE) {
@@ -361,11 +352,8 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             
             int idx = (int32_t)lgt + 128;
             long long ex = d_EXP2_TABLE[idx];
-            
-            // Store logits in s_x (safe reuse, we are done with resid for this step)
-            // Cast to int32 buffer at start
              ((int32_t*)s_x)[tid] = (int32_t)ex; 
-             ((int8_t*)s_x)[HIDDEN_DIM*4 + tid] = lgt; // Keep raw logit at offset
+             ((int8_t*)s_x)[HIDDEN_DIM*4 + tid] = lgt; 
         }
         __syncthreads();
 
@@ -388,7 +376,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
              int32_t tgt_val = (int32_t)tgt_lgt + 128;
              my_loss += (log_sum - tgt_val);
         }
-        __syncthreads(); // Sync before next step overwrites s_x
+        __syncthreads(); 
     }
 
     if (tid == 0) accum_loss[p_idx] = (int32_t)my_loss;
@@ -404,19 +392,22 @@ __global__ void compute_fitness_kernel(const int32_t *accum_loss, int32_t *fitne
 __global__ void update_matrix_kernel(int8_t *W, int rows, int cols, int off_A, int off_B, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Shared counter for block
     __shared__ int s_count;
     if (threadIdx.x == 0) s_count = 0;
     __syncthreads();
 
     int change = 0;
     if (idx < rows * cols) {
-        int r = idx % rows; int c = idx / rows;
+        // Correct Layout: Row-Major
+        int r = idx / cols; 
+        int c = idx % cols;
+        
         long long vote = 0;
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
             uint32_t s = step_seed + p + seed_base;
-            vote += (long long)fit * noise_from_hash(s + off_A, r) * noise_from_hash(s + off_B, c);
+            // Correlate noise. A -> Col (Output), B -> Row (Input), based on Forward pass.
+            vote += (long long)fit * noise_from_hash(s + off_A, c) * noise_from_hash(s + off_B, r);
         }
         int8_t w = W[idx];
         if(vote > thres && w < MAX_VAL) { w++; change=1; }
@@ -433,7 +424,6 @@ __global__ void update_matrix_kernel(int8_t *W, int rows, int cols, int off_A, i
 __global__ void update_vector_kernel(int8_t *V, int len, int off_A, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Shared counter for block
     __shared__ int s_count;
     if (threadIdx.x == 0) s_count = 0;
     __syncthreads();
@@ -463,18 +453,12 @@ __global__ void generate_sequence_kernel(
     int8_t * __restrict__ kv_cache,
     uint32_t seed
 ) {
-    // Single sequence generation
     if (blockIdx.x > 0) return;
     int tid = threadIdx.x;
     if (tid >= HIDDEN_DIM) return;
 
-    // Layout: same as train, but no population noise logic required for model weights (uses mean/base?)
-    // Actually, the model weights are int8. We just use them directly. 
-    // Training used noise injection into weights: (w + noise). Here we leverage just w? 
-    // The "egg" training implies the weights are the "mean" parameter. Yes.
-
+    extern __shared__ int8_t s_mem[];
     int8_t *s_x = s_mem; 
-    typedef cub::BlockReduce<long long, BLOCK_THREADS> BlockReduce;
     __shared__ typename BlockReduce::TempStorage temp_storage;
     __shared__ long long shared_scalar;
     __shared__ int32_t shared_logits[VOCAB_SIZE];
@@ -482,20 +466,16 @@ __global__ void generate_sequence_kernel(
     int total_len = seed_len + gen_len;
     size_t kv_layer_stride = 2ULL * total_len * HIDDEN_DIM;
 
-    // Zero out KV cache for this run? Assumed done by caller or overwriting.
-
-    for (int t = 0; t < total_len - 1; t++) { // Stop before last token output if we just want to generate
-        __syncthreads(); // Sync at start of step
+    for (int t = 0; t < total_len - 1; t++) { 
+        __syncthreads(); 
 
         uint8_t input_token = buffer[t];
         
         // 1. Embedding
         int8_t emb = model->embedding[tid * VOCAB_SIZE + input_token];
-        int8_t pos = model->pos_emb[(t % SEQ_LEN) * HIDDEN_DIM + tid]; // Simple wrap for pos emb?
-        // Or clamp? SEQ_LEN in config is 64. If we generate more, this is an issue. 
-        // Assuming gen fits in context or we slide. For now, wrap.
+        int8_t pos = model->pos_emb[(t % SEQ_LEN) * HIDDEN_DIM + tid]; 
         
-        s_x[tid] = clip((long long)emb + pos); // No noise
+        s_x[tid] = clip((long long)emb + pos);
         __syncthreads();
 
         // 2. Layers
@@ -503,10 +483,8 @@ __global__ void generate_sequence_kernel(
             int8_t *s_norm = &s_mem[HIDDEN_DIM];
 
             // LN 1
-            long long local_sum = abs(s_x[tid]);
-            long long total_sum = BlockReduce(temp_storage).Sum(local_sum);
-            if (tid == 0) shared_scalar = total_sum; __syncthreads();
-            long long mean = shared_scalar / HIDDEN_DIM; if(!mean) mean=1;
+            long long total_sum = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+            long long mean = total_sum / HIDDEN_DIM; if(!mean) mean=1;
             int8_t ln_w = model->ln_1[l][tid];
             int8_t r_in = clip(((long long)s_x[tid] * ln_w) / mean);
             s_norm[tid] = r_in; __syncthreads();
@@ -548,7 +526,6 @@ __global__ void generate_sequence_kernel(
                 __syncthreads();
 
                 int32_t sc = ((int32_t*)s_scores)[h*4/4];
-                // Basic softmax approx
                 int idx = (sc >> 3) + 128; idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
                 int32_t wt = d_EXP2_TABLE[idx];
 
@@ -570,9 +547,8 @@ __global__ void generate_sequence_kernel(
             s_x[tid] = clip((long long)s_x[tid] + (aco >> 8)); __syncthreads();
 
             // MLP
-            long long msum = abs(s_x[tid]);
-            long long mtot = BlockReduce(temp_storage).Sum(msum); if(tid==0) shared_scalar=mtot; __syncthreads();
-            long long mmn = shared_scalar/HIDDEN_DIM; if(!mmn) mmn=1;
+            long long mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+            long long mmn = mtot/HIDDEN_DIM; if(!mmn) mmn=1;
             int8_t l2w = model->ln_2[l][tid];
             int8_t n2x = clip(((long long)s_x[tid] * l2w) / mmn);
             s_norm[tid] = n2x; __syncthreads();
@@ -595,9 +571,8 @@ __global__ void generate_sequence_kernel(
         }
 
         // Final Head
-        long long fsum = abs(s_x[tid]);
-        long long ftot = BlockReduce(temp_storage).Sum(fsum); if(tid==0) shared_scalar=ftot; __syncthreads();
-        long long fmn = shared_scalar/HIDDEN_DIM; if(!fmn) fmn=1;
+        long long ftot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+        long long fmn = ftot/HIDDEN_DIM; if(!fmn) fmn=1;
         int8_t lfw = model->ln_f[tid];
         int8_t nf = clip(((long long)s_x[tid] * lfw) / fmn);
         int8_t *s_norm = &s_mem[HIDDEN_DIM];
@@ -748,7 +723,7 @@ int main() {
         
         update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>(d_model->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, d_fit, seed, thres);
         update_matrix_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512 >>>((int8_t*)d_model->head, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_HEAD, SEED_OFF_HEAD+VOCAB_SIZE, 0, d_fit, seed, thres);
-        update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model->embedding, VOCAB_SIZE, HIDDEN_DIM, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, thres);
+        update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, thres);
         
         CHECK_CUDA(cudaDeviceSynchronize());
         clock_gettime(CLOCK_MONOTONIC, &t1);
