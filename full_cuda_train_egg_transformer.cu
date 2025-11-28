@@ -25,10 +25,10 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 768
+#define HIDDEN_DIM 256
 #define HEAD_DIM 64
 #define N_LAYERS 4
-#define SEQ_LEN 64     
+#define SEQ_LEN 512     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
 #define MAX_BLOCK_THREADS 1024 
@@ -37,7 +37,7 @@ void handle_sigint(int sig) {
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 // Population Sizing (Target 20GB)
-#define POPULATION_SIZE 8192 
+#define POPULATION_SIZE 8192 * 2
 
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 4
@@ -88,9 +88,20 @@ int8_t *d_kv_cache = NULL;
 __constant__ int32_t d_EXP2_TABLE[256];
 int32_t h_EXP2_TABLE[256];
 __device__ int32_t d_debug_updates[2];
+__device__ unsigned long long d_total_updates;
 
 // --- HOST HELPER ---
-int get_update_threshold(double loss) { return (loss > 2.0) ? 5000 : 50000; } 
+int get_update_threshold(double loss) {
+    if (loss > 6.0) return 100;
+    if (loss > 5.0) return 1000;
+    if (loss > 4.8) return 2000;
+    if (loss > 4.4) return 4000;
+    if (loss > 4.25) return 8000;
+    if (loss > 4.2) return 16000;
+    if (loss > 4.0) return 20000;
+    if (loss > 1.0) return 20000;
+    return 20000; 
+}
 
 double get_time_diff_ms(struct timespec start, struct timespec end) {
     return ((end.tv_sec - start.tv_sec) * 1000.0) + ((end.tv_nsec - start.tv_nsec) / 1e6);
@@ -368,7 +379,10 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
              if (sum_ex > 0) {
                  long long x = sum_ex; int pos=0;
                  while(x>=256){x>>=8; pos+=8;} if(x>=16){x>>=4; pos+=4;} if(x>=2){pos+=1;}
-                 log_sum = (pos<<4) + ((sum_ex-(1LL<<pos))<<(4-pos)) - 64; 
+                 
+                 long long rem = sum_ex - (1LL << pos);
+                 long long frac = (pos >= 4) ? (rem >> (pos - 4)) : (rem << (4 - pos));
+                 log_sum = (pos<<4) + frac - 64; 
              }
              int8_t tgt_lgt = ((int8_t*)s_x)[HIDDEN_DIM*4 + target_token];
              int32_t tgt_val = (int32_t)tgt_lgt + 128;
@@ -389,36 +403,274 @@ __global__ void compute_fitness_kernel(const int32_t *accum_loss, int32_t *fitne
 
 __global__ void update_matrix_kernel(int8_t *W, int rows, int cols, int off_A, int off_B, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= rows * cols) return;
-    int r = idx % rows; int c = idx / rows;
-    long long vote = 0;
-    for(int p=0; p < POPULATION_SIZE/2; p++) {
-        int fit = fitnesses[p]; if(fit==0) continue;
-        uint32_t s = step_seed + p + seed_base;
-        vote += (long long)fit * noise_from_hash(s + off_A, r) * noise_from_hash(s + off_B, c);
+    
+    // Shared counter for block
+    __shared__ int s_count;
+    if (threadIdx.x == 0) s_count = 0;
+    __syncthreads();
+
+    int change = 0;
+    if (idx < rows * cols) {
+        int r = idx % rows; int c = idx / rows;
+        long long vote = 0;
+        for(int p=0; p < POPULATION_SIZE/2; p++) {
+            int fit = fitnesses[p]; if(fit==0) continue;
+            uint32_t s = step_seed + p + seed_base;
+            vote += (long long)fit * noise_from_hash(s + off_A, r) * noise_from_hash(s + off_B, c);
+        }
+        int8_t w = W[idx];
+        if(vote > thres && w < MAX_VAL) { w++; change=1; }
+        else if(vote < -thres && w > MIN_VAL) { w--; change=1; }
+        W[idx] = w;
     }
-    int8_t w = W[idx];
-    if(vote > thres && w < MAX_VAL) w++; else if(vote < -thres && w > MIN_VAL) w--;
-    W[idx] = w;
+
+    if (change) atomicAdd(&s_count, 1);
+    __syncthreads();
+
+    if (threadIdx.x == 0 && s_count > 0) atomicAdd(&d_total_updates, (unsigned long long)s_count);
 }
 
 __global__ void update_vector_kernel(int8_t *V, int len, int off_A, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= len) return;
-    long long vote = 0;
-    for(int p=0; p < POPULATION_SIZE/2; p++) {
-        int fit = fitnesses[p]; if(fit==0) continue;
-        vote += (long long)fit * noise_from_hash(step_seed + p + seed_base + off_A, idx);
+
+    // Shared counter for block
+    __shared__ int s_count;
+    if (threadIdx.x == 0) s_count = 0;
+    __syncthreads();
+
+    int change = 0;
+    if (idx < len) {
+        long long vote = 0;
+        for(int p=0; p < POPULATION_SIZE/2; p++) {
+            int fit = fitnesses[p]; if(fit==0) continue;
+            vote += (long long)fit * noise_from_hash(step_seed + p + seed_base + off_A, idx);
+        }
+        int8_t v = V[idx];
+        if(vote > thres && v < MAX_VAL) { v++; change=1; }
+        else if(vote < -thres && v > MIN_VAL) { v--; change=1; }
+        V[idx] = v;
     }
-    int8_t v = V[idx];
-    if(vote > thres && v < MAX_VAL) v++; else if(vote < -thres && v > MIN_VAL) v--;
-    V[idx] = v;
+
+    if (change) atomicAdd(&s_count, 1);
+    __syncthreads();
+
+    if (threadIdx.x == 0 && s_count > 0) atomicAdd(&d_total_updates, (unsigned long long)s_count);
+}
+
+__global__ void generate_sequence_kernel(
+    uint8_t * buffer, int seed_len, int gen_len,
+    const TransformerModel * __restrict__ model,
+    int8_t * __restrict__ kv_cache,
+    uint32_t seed
+) {
+    // Single sequence generation
+    if (blockIdx.x > 0) return;
+    int tid = threadIdx.x;
+    if (tid >= HIDDEN_DIM) return;
+
+    // Layout: same as train, but no population noise logic required for model weights (uses mean/base?)
+    // Actually, the model weights are int8. We just use them directly. 
+    // Training used noise injection into weights: (w + noise). Here we leverage just w? 
+    // The "egg" training implies the weights are the "mean" parameter. Yes.
+
+    int8_t *s_x = s_mem; 
+    typedef cub::BlockReduce<long long, BLOCK_THREADS> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    __shared__ long long shared_scalar;
+    __shared__ int32_t shared_logits[VOCAB_SIZE];
+
+    int total_len = seed_len + gen_len;
+    size_t kv_layer_stride = 2ULL * total_len * HIDDEN_DIM;
+
+    // Zero out KV cache for this run? Assumed done by caller or overwriting.
+
+    for (int t = 0; t < total_len - 1; t++) { // Stop before last token output if we just want to generate
+        __syncthreads(); // Sync at start of step
+
+        uint8_t input_token = buffer[t];
+        
+        // 1. Embedding
+        int8_t emb = model->embedding[tid * VOCAB_SIZE + input_token];
+        int8_t pos = model->pos_emb[(t % SEQ_LEN) * HIDDEN_DIM + tid]; // Simple wrap for pos emb?
+        // Or clamp? SEQ_LEN in config is 64. If we generate more, this is an issue. 
+        // Assuming gen fits in context or we slide. For now, wrap.
+        
+        s_x[tid] = clip((long long)emb + pos); // No noise
+        __syncthreads();
+
+        // 2. Layers
+        for (int l = 0; l < N_LAYERS; l++) {
+            int8_t *s_norm = &s_mem[HIDDEN_DIM];
+
+            // LN 1
+            long long local_sum = abs(s_x[tid]);
+            long long total_sum = BlockReduce(temp_storage).Sum(local_sum);
+            if (tid == 0) shared_scalar = total_sum; __syncthreads();
+            long long mean = shared_scalar / HIDDEN_DIM; if(!mean) mean=1;
+            int8_t ln_w = model->ln_1[l][tid];
+            int8_t r_in = clip(((long long)s_x[tid] * ln_w) / mean);
+            s_norm[tid] = r_in; __syncthreads();
+
+            // QKV
+            const int8_t *wq = &model->w_q[l][0];
+            const int8_t *wk = &model->w_k[l][0];
+            const int8_t *wv = &model->w_v[l][0];
+            
+            long long aq=0, ak=0, av=0;
+            for(int k=0; k<HIDDEN_DIM; k++) {
+                int8_t v = s_norm[k];
+                aq += (long long)v * wq[k*HIDDEN_DIM + tid];
+                ak += (long long)v * wk[k*HIDDEN_DIM + tid];
+                av += (long long)v * wv[k*HIDDEN_DIM + tid];
+            }
+            int8_t qv = clip(aq>>8), kv = clip(ak>>8), vv = clip(av>>8);
+
+            // Store KV
+            int8_t *lkv = kv_cache + (l * kv_layer_stride);
+            lkv[t*HIDDEN_DIM + tid] = kv;
+            lkv[total_len*HIDDEN_DIM + t*HIDDEN_DIM + tid] = vv;
+            __syncthreads();
+
+            // Attention
+            int h = tid / HEAD_DIM;
+            int8_t *s_scores = &s_mem[2*HIDDEN_DIM];
+            if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
+            __syncthreads();
+
+            long long w_v_sum = 0;
+            long long tot_sc = 0;
+
+            for(int ctx=0; ctx <= t; ctx++) {
+                int8_t k_ctx = lkv[ctx*HIDDEN_DIM + tid];
+                long long df = (long long)qv * k_ctx;
+                for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
+                if ((tid % 32) == 0) atomicAdd((int32_t*)&s_scores[h*4], (int32_t)df);
+                __syncthreads();
+
+                int32_t sc = ((int32_t*)s_scores)[h*4/4];
+                // Basic softmax approx
+                int idx = (sc >> 3) + 128; idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+                int32_t wt = d_EXP2_TABLE[idx];
+
+                int8_t v_ctx = lkv[total_len*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
+                w_v_sum += (long long)wt * v_ctx;
+                tot_sc += wt;
+                
+                if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
+                __syncthreads();
+            }
+            if(tot_sc==0) tot_sc=1;
+            int8_t ao = clip(w_v_sum / tot_sc);
+            s_norm[tid] = ao; __syncthreads();
+
+            // Output
+            const int8_t *wo = &model->w_o[l][0];
+            long long aco = 0;
+            for(int k=0; k<HIDDEN_DIM; k++) aco += (long long)s_norm[k] * wo[k*HIDDEN_DIM + tid];
+            s_x[tid] = clip((long long)s_x[tid] + (aco >> 8)); __syncthreads();
+
+            // MLP
+            long long msum = abs(s_x[tid]);
+            long long mtot = BlockReduce(temp_storage).Sum(msum); if(tid==0) shared_scalar=mtot; __syncthreads();
+            long long mmn = shared_scalar/HIDDEN_DIM; if(!mmn) mmn=1;
+            int8_t l2w = model->ln_2[l][tid];
+            int8_t n2x = clip(((long long)s_x[tid] * l2w) / mmn);
+            s_norm[tid] = n2x; __syncthreads();
+
+            int8_t *s_mlp = &s_mem[2*HIDDEN_DIM + 256];
+            const int8_t *wup = &model->w_up[l][0];
+            for(int sub=0; sub<4; sub++) {
+                int oidx = tid + sub*HIDDEN_DIM;
+                long long aup = 0;
+                for(int k=0; k<HIDDEN_DIM; k++) aup += (long long)s_norm[k] * wup[k*(4*HIDDEN_DIM) + oidx];
+                int8_t v = clip(aup>>8); if(v<0) v=0;
+                s_mlp[oidx] = v;
+            }
+            __syncthreads();
+
+            const int8_t *wdn = &model->w_down[l][0];
+            long long adn = 0;
+            for(int k=0; k<(4*HIDDEN_DIM); k++) adn += (long long)s_mlp[k] * wdn[k*HIDDEN_DIM + tid];
+            s_x[tid] = clip((long long)s_x[tid] + (adn >> 9)); __syncthreads();
+        }
+
+        // Final Head
+        long long fsum = abs(s_x[tid]);
+        long long ftot = BlockReduce(temp_storage).Sum(fsum); if(tid==0) shared_scalar=ftot; __syncthreads();
+        long long fmn = shared_scalar/HIDDEN_DIM; if(!fmn) fmn=1;
+        int8_t lfw = model->ln_f[tid];
+        int8_t nf = clip(((long long)s_x[tid] * lfw) / fmn);
+        int8_t *s_norm = &s_mem[HIDDEN_DIM];
+        s_norm[tid] = nf; __syncthreads();
+
+        if(tid < VOCAB_SIZE) {
+            long long ah = 0;
+            const int8_t *wh = &model->head[0];
+            for(int k=0; k<HIDDEN_DIM; k++) ah += (long long)s_norm[k] * wh[k*VOCAB_SIZE + tid];
+            shared_logits[tid] = (int32_t)d_EXP2_TABLE[(int32_t)clip(ah>>8) + 128];
+        }
+        __syncthreads();
+
+        // Sample (Thread 0)
+        if (t >= seed_len - 1) {
+            if (tid == 0) {
+                long long sum_exp = 0;
+                for(int i=0; i<VOCAB_SIZE; i++) sum_exp += shared_logits[i];
+                
+                uint32_t s = seed + t * 555;
+                uint32_t r = hash_rng(s, 0);
+                long long thresh = (sum_exp > 0) ? (r % sum_exp) : 0;
+                long long running = 0;
+                int selected = 0;
+                for(int i=0; i<VOCAB_SIZE; i++) {
+                    running += shared_logits[i];
+                    if(running > thresh) { selected = i; break; }
+                }
+                buffer[t + 1] = (uint8_t)selected;
+            }
+        }
+        __syncthreads();
+    }
 }
 
 int main() {
     signal(SIGINT, handle_sigint);
     init_tables();
     cudaMemcpyToSymbol(d_EXP2_TABLE, h_EXP2_TABLE, 256*sizeof(int32_t));
+
+    // --- CONFIG REPORT ---
+    long long n_params_emb = (long long)VOCAB_SIZE * HIDDEN_DIM;
+    long long n_params_pos = (long long)SEQ_LEN * HIDDEN_DIM;
+    long long n_params_per_layer = (
+        (4LL * HIDDEN_DIM * HIDDEN_DIM) + // Q,K,V,O
+        (2LL * HIDDEN_DIM * (4 * HIDDEN_DIM)) + // Up, Down
+        (2LL * HIDDEN_DIM) // LN1, LN2
+    );
+    long long n_params_layers = (long long)N_LAYERS * n_params_per_layer;
+    long long n_params_head = (long long)HIDDEN_DIM * VOCAB_SIZE;
+    long long n_params_ln_f = HIDDEN_DIM;
+    long long total_params = n_params_emb + n_params_pos + n_params_layers + n_params_head + n_params_ln_f;
+
+    size_t kv_cache_bytes = (size_t)POPULATION_SIZE * N_LAYERS * 2 * SEQ_LEN * HIDDEN_DIM;
+    size_t model_bytes = sizeof(TransformerModel);
+    size_t pop_state_bytes = (POPULATION_SIZE * sizeof(int32_t)) + ((POPULATION_SIZE/2) * sizeof(int32_t));
+
+    printf("\n=== EGG TRANSFORMER CONFIGURATION ===\n");
+    printf("Architecture:\n");
+    printf("  Dim: %d | Heads: %d | Layers: %d | Head Dim: %d\n", HIDDEN_DIM, N_HEADS, N_LAYERS, HEAD_DIM);
+    printf("  Seq Len: %d | Vocab: %d\n", SEQ_LEN, VOCAB_SIZE);
+    printf("\nParameters (int8):\n");
+    printf("  Embedding: %lld\n", n_params_emb);
+    printf("  Pos Emb:   %lld\n", n_params_pos);
+    printf("  Layers:    %lld (%d x %lld)\n", n_params_layers, N_LAYERS, n_params_per_layer);
+    printf("  Head:      %lld\n", n_params_head);
+    printf("  TOTAL:     %lld (%.2f M)\n", total_params, total_params / 1000000.0);
+    printf("\nMemory Usage:\n");
+    printf("  KV Cache:   %.2f GB (Pop: %d)\n", kv_cache_bytes / (1024.0*1024*1024), POPULATION_SIZE);
+    printf("  Model Wgts: %.2f MB\n", model_bytes / (1024.0*1024));
+    printf("  Pop State:  %.2f MB\n", pop_state_bytes / (1024.0*1024));
+    printf("=====================================\n\n");
+    // ---------------------
 
     Dataset ds = {0,0};
     FILE *f = fopen("input.txt", "rb");
@@ -442,6 +694,17 @@ int main() {
     printf("Allocating KV Cache: %.2f GB\n", kv_size / (1024.0*1024*1024));
     CHECK_CUDA(cudaMalloc(&d_kv_cache, kv_size));
 
+    // Get address of global update counter
+    unsigned long long *d_updates_ptr;
+    CHECK_CUDA(cudaGetSymbolAddress((void**)&d_updates_ptr, d_total_updates));
+    
+    // Generation buffers
+    int gen_seed_len = 32;
+    int gen_output_len = 64; 
+    int total_gen_len = gen_seed_len + gen_output_len;
+    uint8_t *d_gen_buf; CHECK_CUDA(cudaMalloc(&d_gen_buf, total_gen_len));
+    int8_t *d_gen_kv; CHECK_CUDA(cudaMalloc(&d_gen_kv, N_LAYERS * 2 * total_gen_len * HIDDEN_DIM));
+
     printf("Starting Transformer Training (Pop=%d, Dim=%d)...\n", POPULATION_SIZE, HIDDEN_DIM);
     long max_steps = (ds.length - 1) / SEQ_LEN;
 
@@ -462,6 +725,9 @@ int main() {
         long long total_loss = thrust::reduce(t_loss, t_loss + POPULATION_SIZE);
         double avg_loss = (double)total_loss / (POPULATION_SIZE * SEQ_LEN * 16.0); // Normalization factor approx
         int thres = get_update_threshold(avg_loss);
+
+        // Reset update counter
+        CHECK_CUDA(cudaMemset(d_updates_ptr, 0, sizeof(unsigned long long)));
 
         for(int l=0; l<N_LAYERS; l++) {
             int s_base = l * 1000;
@@ -487,8 +753,40 @@ int main() {
         CHECK_CUDA(cudaDeviceSynchronize());
         clock_gettime(CLOCK_MONOTONIC, &t1);
         
-        if(step % 10 == 0) printf("Step %ld | Loss: %.4f | Time: %.2f ms\n", step, avg_loss, get_time_diff_ms(t0, t1));
+        // Get update count
+        unsigned long long h_updates = 0;
+        CHECK_CUDA(cudaMemcpy(&h_updates, d_updates_ptr, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        
+        double step_ms = get_time_diff_ms(t0, t1);
+        double tokens_per_sec = (double)(POPULATION_SIZE * SEQ_LEN) / (step_ms / 1000.0);
+
+        // Always print step info
+        printf("Step %ld | Loss: %.4f | Time: %.2f ms | Updates: %llu | Speed: %.2f tok/s\n", 
+            step, avg_loss, step_ms, h_updates, tokens_per_sec);
+
+        // Generate Example every 100 steps
+        if (step % 5 == 0) {
+            CHECK_CUDA(cudaMemcpy(d_gen_buf, d_dataset + (step*SEQ_LEN) % (ds.length-SEQ_LEN), gen_seed_len, cudaMemcpyDeviceToDevice));
+            generate_sequence_kernel<<<1, BLOCK_THREADS, sm_size>>>(
+                d_gen_buf, gen_seed_len, gen_output_len, d_model, d_gen_kv, seed+999
+            );
+            CHECK_CUDA(cudaDeviceSynchronize());
+            uint8_t h_buf[256]; // gen_seed_len + gen_output_len < 256
+            CHECK_CUDA(cudaMemcpy(h_buf, d_gen_buf, total_gen_len, cudaMemcpyDeviceToHost));
+            
+            printf("\n--- GENERATION ---\n");
+            printf("\033[32m"); // Green for seed
+            for(int i=0; i<gen_seed_len; i++) {
+                char c = h_buf[i]; printf("%c", (c>=32 && c<=126) ? c : '.');
+            }
+            printf("\033[36m"); // Cyan for gen
+            for(int i=gen_seed_len; i<total_gen_len; i++) {
+                char c = h_buf[i]; printf("%c", (c>=32 && c<=126) ? c : '.');
+            }
+            printf("\033[0m\n\n");
+        }
     }
+    cudaFree(d_gen_buf); cudaFree(d_gen_kv);
 
     free(h_model); free(ds.data);
     cudaFree(d_model); cudaFree(d_dataset); cudaFree(d_loss); cudaFree(d_fit); cudaFree(d_kv_cache);
