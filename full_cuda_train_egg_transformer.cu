@@ -37,7 +37,7 @@ void handle_sigint(int sig) {
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 // Population Sizing (Target 20GB)
-#define POPULATION_SIZE 8192 * 2
+#define POPULATION_SIZE 8192 * 8
 
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 0
@@ -66,24 +66,31 @@ void handle_sigint(int sig) {
 
 #define CHECK_CUDA(call) { cudaError_t err = call; if (err != cudaSuccess) { printf("CUDA Error: %s:%d\n", cudaGetErrorString(err), __LINE__); exit(1); } }
 
+// --- TYPE ALIASES ---
+using WeightType    = int8_t;
+using ActType       = int8_t;
+using AccumType     = int32_t;   // 32-bit sufficient for ~6M max sum
+using AttnAccumType = long long; // Need high precision for attention weighted sum
+using VoteType      = int32_t;
+
 typedef struct { uint8_t *data; long length; } Dataset;
 
 typedef struct {
-    int8_t embedding[VOCAB_SIZE * HIDDEN_DIM];
-    int8_t pos_emb[SEQ_LEN * HIDDEN_DIM];
-    int8_t ln_1[N_LAYERS][HIDDEN_DIM];
-    int8_t w_q[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
-    int8_t w_k[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
-    int8_t w_v[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
-    int8_t w_o[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
-    int8_t ln_2[N_LAYERS][HIDDEN_DIM];
-    int8_t w_up[N_LAYERS][HIDDEN_DIM * (HIDDEN_DIM * 4)];
-    int8_t w_down[N_LAYERS][(HIDDEN_DIM * 4) * HIDDEN_DIM];
-    int8_t ln_f[HIDDEN_DIM];
-    int8_t head[HIDDEN_DIM * VOCAB_SIZE];
+    WeightType embedding[VOCAB_SIZE * HIDDEN_DIM];
+    WeightType pos_emb[SEQ_LEN * HIDDEN_DIM];
+    WeightType ln_1[N_LAYERS][HIDDEN_DIM];
+    WeightType w_q[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
+    WeightType w_k[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
+    WeightType w_v[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
+    WeightType w_o[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
+    WeightType ln_2[N_LAYERS][HIDDEN_DIM];
+    WeightType w_up[N_LAYERS][HIDDEN_DIM * (HIDDEN_DIM * 4)];
+    WeightType w_down[N_LAYERS][(HIDDEN_DIM * 4) * HIDDEN_DIM];
+    WeightType ln_f[HIDDEN_DIM];
+    WeightType head[HIDDEN_DIM * VOCAB_SIZE];
 } TransformerModel;
 
-int8_t *d_kv_cache = NULL;
+ActType *d_kv_cache = NULL;
 
 __constant__ int32_t d_EXP2_TABLE[256];
 int32_t h_EXP2_TABLE[256];
@@ -93,11 +100,11 @@ __device__ unsigned long long d_total_updates;
 // --- HOST HELPER ---
 int get_update_threshold(double loss) {
     if (loss > 6.0) return 100;
-    if (loss > 4.0) return 100;
-    if (loss > 3.7) return 2000;
-    if (loss > 3.4) return 4000;
-    if (loss > 3.25) return 8000;
-    if (loss > 3.2) return 16000;
+    if (loss > 4.2) return 2000;
+    if (loss > 4.0) return 4000;
+    if (loss > 3.9) return 8000;
+    if (loss > 3.8) return 16000;
+    if (loss > 3.6) return 32000;
     if (loss > 3.0) return 20000;
     if (loss > 1.0) return 20000;
     return 20000; 
@@ -144,7 +151,7 @@ void init_model(TransformerModel *model) {
 
 // --- DEVICE KERNELS & HELPERS ---
 
-typedef cub::BlockReduce<long long, BLOCK_THREADS> BlockReduce;
+typedef cub::BlockReduce<AccumType, BLOCK_THREADS> BlockReduce;
 
 __device__ __forceinline__ uint32_t hash_rng(uint32_t s, uint32_t idx) {
     uint32_t x = s + idx * 0x9e3779b9u; x ^= x >> 16; x *= 0x85ebca6b; x ^= x >> 13; x *= 0xc2b2ae35; x ^= x >> 16; return x;
@@ -152,11 +159,11 @@ __device__ __forceinline__ uint32_t hash_rng(uint32_t s, uint32_t idx) {
 __device__ __forceinline__ int8_t noise_from_hash(uint32_t s, uint32_t idx) {
     uint32_t r = hash_rng(s, idx); return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 15));
 }
-__device__ __forceinline__ int8_t clip(long long a) { return (a > MAX_VAL) ? MAX_VAL : ((a < MIN_VAL) ? MIN_VAL : (int8_t)a); }
+__device__ __forceinline__ int8_t clip(AccumType a) { return (a > MAX_VAL) ? MAX_VAL : ((a < MIN_VAL) ? MIN_VAL : (int8_t)a); }
 
 // Helper: Sum reduction + Broadcast
-__device__ __forceinline__ long long block_reduce_sum_broadcast(long long val, BlockReduce::TempStorage &storage, long long &shared_var) {
-    long long total = BlockReduce(storage).Sum(val);
+__device__ __forceinline__ AccumType block_reduce_sum_broadcast(AccumType val, BlockReduce::TempStorage &storage, AccumType &shared_var) {
+    AccumType total = BlockReduce(storage).Sum(val);
     if (threadIdx.x == 0) shared_var = total;
     __syncthreads();
     return shared_var;
@@ -165,7 +172,7 @@ __device__ __forceinline__ long long block_reduce_sum_broadcast(long long val, B
 __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     const uint8_t * __restrict__ dataset, long data_len, int start_idx,
     const TransformerModel * __restrict__ model,
-    int8_t * __restrict__ global_kv_cache,
+    ActType * __restrict__ global_kv_cache,
     int32_t *accum_loss, uint32_t step_seed
 ) {
     int p_idx = blockIdx.x; 
@@ -173,10 +180,10 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     int tid = threadIdx.x;
     if (tid >= HIDDEN_DIM) return;
 
-    extern __shared__ int8_t s_mem[];
-    int8_t *s_x = s_mem; 
+    extern __shared__ ActType s_mem[];
+    ActType *s_x = s_mem; 
     __shared__ typename BlockReduce::TempStorage temp_storage;
-    __shared__ long long shared_scalar;
+    __shared__ AccumType shared_scalar;
 
     long pair_idx = p_idx / 2;
     long stride = data_len / (POPULATION_SIZE / 2);
@@ -185,59 +192,60 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     size_t kv_layer_stride = 2ULL * SEQ_LEN * HIDDEN_DIM;
     size_t kv_ind_offset = (size_t)p_idx * N_LAYERS * kv_layer_stride;
 
-    long long my_loss = 0;
+    long long my_loss = 0; // Loss accumulation needs high precision
 
     for (int t = 0; t < SEQ_LEN; t++) {
         
         // 1. Embedding
         uint8_t input_token = dataset[stream_pos + t];
         uint32_t seed_emb = (step_seed + pair_idx) + SEED_OFF_EMB;
-        int8_t emb = model->embedding[tid * VOCAB_SIZE + input_token];
-        int8_t pos = model->pos_emb[t * HIDDEN_DIM + tid];
+        WeightType emb = model->embedding[tid * VOCAB_SIZE + input_token];
+        WeightType pos = model->pos_emb[t * HIDDEN_DIM + tid];
         int8_t a_tok = noise_from_hash(seed_emb, input_token);
         int8_t b_dim = noise_from_hash(seed_emb + HIDDEN_DIM, tid);
-        long long perturb = ((long long)a_tok * b_dim * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-        s_x[tid] = clip((long long)emb + pos + perturb);
+        AccumType perturb = ((AccumType)a_tok * b_dim * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+        s_x[tid] = clip((AccumType)emb + pos + perturb);
         __syncthreads();
 
         // 2. Stack
         for (int l = 0; l < N_LAYERS; l++) {
             uint32_t seed_base = (step_seed + pair_idx) + (l * 1000);
-            int8_t *s_norm = &s_mem[HIDDEN_DIM]; // Normalized buf
+            ActType *s_norm = &s_mem[HIDDEN_DIM]; // Normalized buf
 
             // LN 1
-            long long total_sum = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-            long long mean = total_sum / HIDDEN_DIM; if(!mean) mean=1;
-            int8_t ln_w = model->ln_1[l][tid];
+            AccumType total_sum = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+            AccumType mean = total_sum / HIDDEN_DIM; if(!mean) mean=1;
+            WeightType ln_w = model->ln_1[l][tid];
             int8_t ln_n = noise_from_hash(seed_base + SEED_OFF_LN_1, tid);
-            int8_t r_in = clip(((long long)s_x[tid] * (ln_w + (((long long)ln_n * ns) >> SIGMA_SHIFT_VECTOR))) / mean);
+            ActType r_in = clip(((AccumType)s_x[tid] * (ln_w + (((AccumType)ln_n * ns) >> SIGMA_SHIFT_VECTOR))) / mean);
             s_norm[tid] = r_in; __syncthreads();
 
             // QKV Projection (Rank-1 Fast)
-            long long sbq = block_reduce_sum_broadcast((long long)r_in * noise_from_hash(seed_base + SEED_OFF_Q_B, tid), temp_storage, shared_scalar);
-            long long sbk = block_reduce_sum_broadcast((long long)r_in * noise_from_hash(seed_base + SEED_OFF_K_B, tid), temp_storage, shared_scalar);
-            long long sbv = block_reduce_sum_broadcast((long long)r_in * noise_from_hash(seed_base + SEED_OFF_V_B, tid), temp_storage, shared_scalar);
+            AccumType sbq = block_reduce_sum_broadcast((AccumType)r_in * noise_from_hash(seed_base + SEED_OFF_Q_B, tid), temp_storage, shared_scalar);
+            AccumType sbk = block_reduce_sum_broadcast((AccumType)r_in * noise_from_hash(seed_base + SEED_OFF_K_B, tid), temp_storage, shared_scalar);
+            AccumType sbv = block_reduce_sum_broadcast((AccumType)r_in * noise_from_hash(seed_base + SEED_OFF_V_B, tid), temp_storage, shared_scalar);
 
-            long long aq=0, ak=0, av=0;
-            const int8_t *wq = &model->w_q[l][0];
-            const int8_t *wk = &model->w_k[l][0];
-            const int8_t *wv = &model->w_v[l][0];
+            AccumType aq=0, ak=0, av=0;
+            const WeightType *wq = &model->w_q[l][0];
+            const WeightType *wk = &model->w_k[l][0];
+            const WeightType *wv = &model->w_v[l][0];
             
+            #pragma unroll 8
             for(int k=0; k<HIDDEN_DIM; k++) {
-                int8_t v = s_norm[k];
-                aq += (long long)v * wq[k*HIDDEN_DIM + tid];
-                ak += (long long)v * wk[k*HIDDEN_DIM + tid];
-                av += (long long)v * wv[k*HIDDEN_DIM + tid];
+                ActType v = s_norm[k];
+                aq += (AccumType)v * wq[k*HIDDEN_DIM + tid];
+                ak += (AccumType)v * wk[k*HIDDEN_DIM + tid];
+                av += (AccumType)v * wv[k*HIDDEN_DIM + tid];
             }
             if(ns!=0) {
-                aq += ((sbq * (long long)noise_from_hash(seed_base + SEED_OFF_Q_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                ak += ((sbk * (long long)noise_from_hash(seed_base + SEED_OFF_K_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                av += ((sbv * (long long)noise_from_hash(seed_base + SEED_OFF_V_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                aq += ((sbq * (AccumType)noise_from_hash(seed_base + SEED_OFF_Q_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                ak += ((sbk * (AccumType)noise_from_hash(seed_base + SEED_OFF_K_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                av += ((sbv * (AccumType)noise_from_hash(seed_base + SEED_OFF_V_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
             }
-            int8_t qv = clip(aq>>8), kv = clip(ak>>8), vv = clip(av>>8);
+            ActType qv = clip(aq>>8), kv = clip(ak>>8), vv = clip(av>>8);
             
             // Store KV
-            int8_t *lkv = global_kv_cache + kv_ind_offset + (l * kv_layer_stride);
+            ActType *lkv = global_kv_cache + kv_ind_offset + (l * kv_layer_stride);
             lkv[t*HIDDEN_DIM + tid] = kv;
             lkv[SEQ_LEN*HIDDEN_DIM + t*HIDDEN_DIM + tid] = vv;
             __syncthreads();
@@ -248,12 +256,12 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
             __syncthreads();
 
-            long long w_v_sum = 0;
-            long long tot_sc = 0;
+            AttnAccumType w_v_sum = 0;
+            AttnAccumType tot_sc = 0;
             
             for(int ctx=0; ctx <= t; ctx++) {
-                 int8_t k_ctx = lkv[ctx*HIDDEN_DIM + tid];
-                 long long df = (long long)qv * k_ctx;
+                 ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
+                 AccumType df = (AccumType)qv * k_ctx;
                  
                  // Reduce across head (Head Size 64, Warp 32)
                  // Need shuffle to reduce 64 to 1.
@@ -268,48 +276,50 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                  int idx = (sc >> 3) + 128; idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
                  int32_t wt = d_EXP2_TABLE[idx];
                  
-                 int8_t v_ctx = lkv[SEQ_LEN*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
-                 w_v_sum += (long long)wt * v_ctx;
+                 ActType v_ctx = lkv[SEQ_LEN*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
+                 w_v_sum += (AttnAccumType)wt * v_ctx;
                  tot_sc += wt;
                  
                  if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0; // Reset
                  __syncthreads();
             }
             if(tot_sc==0) tot_sc=1;
-            int8_t ao = clip(w_v_sum / tot_sc);
+            ActType ao = clip(w_v_sum / tot_sc);
             s_norm[tid] = ao; __syncthreads();
 
             // Output Proj
-            long long sbo = block_reduce_sum_broadcast((long long)ao * noise_from_hash(seed_base + SEED_OFF_O_B, tid), temp_storage, shared_scalar);
+            AccumType sbo = block_reduce_sum_broadcast((AccumType)ao * noise_from_hash(seed_base + SEED_OFF_O_B, tid), temp_storage, shared_scalar);
 
-            const int8_t *wo = &model->w_o[l][0];
-            long long aco = 0;
-            for(int k=0; k<HIDDEN_DIM; k++) aco += (long long)s_norm[k] * wo[k*HIDDEN_DIM + tid];
-            if(ns!=0) aco += ((sbo * (long long)noise_from_hash(seed_base + SEED_OFF_O_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-            s_x[tid] = clip((long long)s_x[tid] + (aco >> 8)); __syncthreads();
+            const WeightType *wo = &model->w_o[l][0];
+            AccumType aco = 0;
+            #pragma unroll 8
+            for(int k=0; k<HIDDEN_DIM; k++) aco += (AccumType)s_norm[k] * wo[k*HIDDEN_DIM + tid];
+            if(ns!=0) aco += ((sbo * (AccumType)noise_from_hash(seed_base + SEED_OFF_O_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+            s_x[tid] = clip((AccumType)s_x[tid] + (aco >> 8)); __syncthreads();
 
             // MLP Block
             // Norm 2
-            long long mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-            long long mmn = mtot/HIDDEN_DIM; if(!mmn) mmn=1;
-            int8_t l2w = model->ln_2[l][tid];
+            AccumType mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+            AccumType mmn = mtot/HIDDEN_DIM; if(!mmn) mmn=1;
+            WeightType l2w = model->ln_2[l][tid];
             int8_t l2n = noise_from_hash(seed_base + SEED_OFF_LN_2, tid);
-            int8_t n2x = clip(((long long)s_x[tid] * (l2w + (((long long)l2n*ns)>>SIGMA_SHIFT_VECTOR))) / mmn);
+            ActType n2x = clip(((AccumType)s_x[tid] * (l2w + (((AccumType)l2n*ns)>>SIGMA_SHIFT_VECTOR))) / mmn);
             s_norm[tid] = n2x; __syncthreads();
 
             // Expand
-            long long sbup = block_reduce_sum_broadcast((long long)n2x * noise_from_hash(seed_base + SEED_OFF_MLP_UP_B, tid), temp_storage, shared_scalar);
+            AccumType sbup = block_reduce_sum_broadcast((AccumType)n2x * noise_from_hash(seed_base + SEED_OFF_MLP_UP_B, tid), temp_storage, shared_scalar);
 
-            int8_t *s_mlp = &s_mem[2*HIDDEN_DIM + 256]; 
+            ActType *s_mlp = &s_mem[2*HIDDEN_DIM + 256]; 
 
-            const int8_t *wup = &model->w_up[l][0];
+            const WeightType *wup = &model->w_up[l][0];
             // Need to compute 4x output dims. Loop.
             for(int sub=0; sub<4; sub++) {
                 int oidx = tid + sub*HIDDEN_DIM;
-                long long aup = 0;
-                for(int k=0; k<HIDDEN_DIM; k++) aup += (long long)s_norm[k] * wup[k*(4*HIDDEN_DIM) + oidx];
-                if(ns!=0) aup += ((sbup * (long long)noise_from_hash(seed_base + SEED_OFF_MLP_UP_A, oidx)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-                int8_t v = clip(aup>>8); if(v<0) v=0; // ReLU
+                AccumType aup = 0;
+                #pragma unroll 8
+                for(int k=0; k<HIDDEN_DIM; k++) aup += (AccumType)s_norm[k] * wup[k*(4*HIDDEN_DIM) + oidx];
+                if(ns!=0) aup += ((sbup * (AccumType)noise_from_hash(seed_base + SEED_OFF_MLP_UP_A, oidx)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+                ActType v = clip(aup>>8); if(v<0) v=0; // ReLU
                 s_mlp[oidx] = v; 
             }
             __syncthreads();
@@ -317,38 +327,40 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             // Down Project
             // Input is s_mlp (4H).
             // Need scalar B projection of s_mlp.
-            long long pbdn = 0;
-            for(int sub=0; sub<4; sub++) pbdn += (long long)s_mlp[tid + sub*HIDDEN_DIM] * noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_B, tid + sub*HIDDEN_DIM);
-            long long sbdn = block_reduce_sum_broadcast(pbdn, temp_storage, shared_scalar);
+            AccumType pbdn = 0;
+            for(int sub=0; sub<4; sub++) pbdn += (AccumType)s_mlp[tid + sub*HIDDEN_DIM] * noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_B, tid + sub*HIDDEN_DIM);
+            AccumType sbdn = block_reduce_sum_broadcast(pbdn, temp_storage, shared_scalar);
 
-            const int8_t *wdn = &model->w_down[l][0];
-            long long adn = 0;
-            for(int k=0; k<(4*HIDDEN_DIM); k++) adn += (long long)s_mlp[k] * wdn[k*HIDDEN_DIM + tid];
-            if(ns!=0) adn += ((sbdn * (long long)noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-            s_x[tid] = clip((long long)s_x[tid] + (adn >> 9)); __syncthreads();
+            const WeightType *wdn = &model->w_down[l][0];
+            AccumType adn = 0;
+            #pragma unroll 8
+            for(int k=0; k<(4*HIDDEN_DIM); k++) adn += (AccumType)s_mlp[k] * wdn[k*HIDDEN_DIM + tid];
+            if(ns!=0) adn += ((sbdn * (AccumType)noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+            s_x[tid] = clip((AccumType)s_x[tid] + (adn >> 9)); __syncthreads();
         }
 
         // 3. Final Head
-        long long ftot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-        long long fmn = ftot/HIDDEN_DIM; if(!fmn) fmn=1;
+        AccumType ftot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+        AccumType fmn = ftot/HIDDEN_DIM; if(!fmn) fmn=1;
         
-        int8_t lfw = model->ln_f[tid];
+        WeightType lfw = model->ln_f[tid];
         int8_t lfn = noise_from_hash(step_seed + pair_idx + SEED_OFF_LN_F, tid);
-        int8_t nf = clip(((long long)s_x[tid] * (lfw + (((long long)lfn*ns)>>SIGMA_SHIFT_VECTOR))) / fmn);
+        ActType nf = clip(((AccumType)s_x[tid] * (lfw + (((AccumType)lfn*ns)>>SIGMA_SHIFT_VECTOR))) / fmn);
         
         // Reuse s_mem[HD] for normed
-        int8_t *s_norm = &s_mem[HIDDEN_DIM];
+        ActType *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
 
-        long long sbh = block_reduce_sum_broadcast((long long)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_HEAD + VOCAB_SIZE, tid), temp_storage, shared_scalar);
+        AccumType sbh = block_reduce_sum_broadcast((AccumType)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_HEAD + VOCAB_SIZE, tid), temp_storage, shared_scalar);
 
         // Compute Logits (only first VOCAB_SIZE threads)
         if(tid < VOCAB_SIZE) {
-            long long ah = 0;
-            const int8_t *wh = &model->head[0];
-            for(int k=0; k<HIDDEN_DIM; k++) ah += (long long)s_norm[k] * wh[k*VOCAB_SIZE + tid];
-            if(ns!=0) ah += ((sbh * (long long)noise_from_hash(step_seed + pair_idx + SEED_OFF_HEAD, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-            int8_t lgt = clip(ah >> 8);
+            AccumType ah = 0;
+            const WeightType *wh = &model->head[0];
+            #pragma unroll 8
+            for(int k=0; k<HIDDEN_DIM; k++) ah += (AccumType)s_norm[k] * wh[k*VOCAB_SIZE + tid];
+            if(ns!=0) ah += ((sbh * (AccumType)noise_from_hash(step_seed + pair_idx + SEED_OFF_HEAD, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+            ActType lgt = clip(ah >> 8);
             
             int idx = (int32_t)lgt + 128;
             long long ex = d_EXP2_TABLE[idx];
@@ -389,7 +401,7 @@ __global__ void compute_fitness_kernel(const int32_t *accum_loss, int32_t *fitne
     fitnesses[idx] = (p < n) ? 1 : ((n < p) ? -1 : 0);
 }
 
-__global__ void update_matrix_kernel(int8_t *W, int rows, int cols, int off_A, int off_B, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
+__global__ void update_matrix_kernel(WeightType *W, int rows, int cols, int off_A, int off_B, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     __shared__ int s_count;
@@ -402,14 +414,14 @@ __global__ void update_matrix_kernel(int8_t *W, int rows, int cols, int off_A, i
         int r = idx / cols; 
         int c = idx % cols;
         
-        long long vote = 0;
+        VoteType vote = 0;
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
             uint32_t s = step_seed + p + seed_base;
             // Correlate noise. A -> Col (Output), B -> Row (Input), based on Forward pass.
-            vote += (long long)fit * noise_from_hash(s + off_A, c) * noise_from_hash(s + off_B, r);
+            vote += (VoteType)fit * noise_from_hash(s + off_A, c) * noise_from_hash(s + off_B, r);
         }
-        int8_t w = W[idx];
+        WeightType w = W[idx];
         if(vote > thres && w < MAX_VAL) { w++; change=1; }
         else if(vote < -thres && w > MIN_VAL) { w--; change=1; }
         W[idx] = w;
@@ -421,7 +433,7 @@ __global__ void update_matrix_kernel(int8_t *W, int rows, int cols, int off_A, i
     if (threadIdx.x == 0 && s_count > 0) atomicAdd(&d_total_updates, (unsigned long long)s_count);
 }
 
-__global__ void update_vector_kernel(int8_t *V, int len, int off_A, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
+__global__ void update_vector_kernel(WeightType *V, int len, int off_A, int seed_base, const int32_t *fitnesses, uint32_t step_seed, int thres) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     __shared__ int s_count;
@@ -430,12 +442,12 @@ __global__ void update_vector_kernel(int8_t *V, int len, int off_A, int seed_bas
 
     int change = 0;
     if (idx < len) {
-        long long vote = 0;
+        VoteType vote = 0;
         for(int p=0; p < POPULATION_SIZE/2; p++) {
             int fit = fitnesses[p]; if(fit==0) continue;
-            vote += (long long)fit * noise_from_hash(step_seed + p + seed_base + off_A, idx);
+            vote += (VoteType)fit * noise_from_hash(step_seed + p + seed_base + off_A, idx);
         }
-        int8_t v = V[idx];
+        WeightType v = V[idx];
         if(vote > thres && v < MAX_VAL) { v++; change=1; }
         else if(vote < -thres && v > MIN_VAL) { v--; change=1; }
         V[idx] = v;
@@ -450,17 +462,17 @@ __global__ void update_vector_kernel(int8_t *V, int len, int off_A, int seed_bas
 __global__ void generate_sequence_kernel(
     uint8_t * buffer, int seed_len, int gen_len,
     const TransformerModel * __restrict__ model,
-    int8_t * __restrict__ kv_cache,
+    ActType * __restrict__ kv_cache,
     uint32_t seed
 ) {
     if (blockIdx.x > 0) return;
     int tid = threadIdx.x;
     if (tid >= HIDDEN_DIM) return;
 
-    extern __shared__ int8_t s_mem[];
-    int8_t *s_x = s_mem; 
+    extern __shared__ ActType s_mem[];
+    ActType *s_x = s_mem; 
     __shared__ typename BlockReduce::TempStorage temp_storage;
-    __shared__ long long shared_scalar;
+    __shared__ AccumType shared_scalar;
     __shared__ int32_t shared_logits[VOCAB_SIZE];
 
     int total_len = seed_len + gen_len;
@@ -472,39 +484,40 @@ __global__ void generate_sequence_kernel(
         uint8_t input_token = buffer[t];
         
         // 1. Embedding
-        int8_t emb = model->embedding[tid * VOCAB_SIZE + input_token];
-        int8_t pos = model->pos_emb[(t % SEQ_LEN) * HIDDEN_DIM + tid]; 
+        WeightType emb = model->embedding[tid * VOCAB_SIZE + input_token];
+        WeightType pos = model->pos_emb[(t % SEQ_LEN) * HIDDEN_DIM + tid]; 
         
-        s_x[tid] = clip((long long)emb + pos);
+        s_x[tid] = clip((AccumType)emb + pos);
         __syncthreads();
 
         // 2. Layers
         for (int l = 0; l < N_LAYERS; l++) {
-            int8_t *s_norm = &s_mem[HIDDEN_DIM];
+            ActType *s_norm = &s_mem[HIDDEN_DIM];
 
             // LN 1
-            long long total_sum = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-            long long mean = total_sum / HIDDEN_DIM; if(!mean) mean=1;
-            int8_t ln_w = model->ln_1[l][tid];
-            int8_t r_in = clip(((long long)s_x[tid] * ln_w) / mean);
+            AccumType total_sum = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+            AccumType mean = total_sum / HIDDEN_DIM; if(!mean) mean=1;
+            WeightType ln_w = model->ln_1[l][tid];
+            ActType r_in = clip(((AccumType)s_x[tid] * ln_w) / mean);
             s_norm[tid] = r_in; __syncthreads();
 
             // QKV
-            const int8_t *wq = &model->w_q[l][0];
-            const int8_t *wk = &model->w_k[l][0];
-            const int8_t *wv = &model->w_v[l][0];
+            const WeightType *wq = &model->w_q[l][0];
+            const WeightType *wk = &model->w_k[l][0];
+            const WeightType *wv = &model->w_v[l][0];
             
-            long long aq=0, ak=0, av=0;
+            AccumType aq=0, ak=0, av=0;
+            #pragma unroll 8
             for(int k=0; k<HIDDEN_DIM; k++) {
-                int8_t v = s_norm[k];
-                aq += (long long)v * wq[k*HIDDEN_DIM + tid];
-                ak += (long long)v * wk[k*HIDDEN_DIM + tid];
-                av += (long long)v * wv[k*HIDDEN_DIM + tid];
+                ActType v = s_norm[k];
+                aq += (AccumType)v * wq[k*HIDDEN_DIM + tid];
+                ak += (AccumType)v * wk[k*HIDDEN_DIM + tid];
+                av += (AccumType)v * wv[k*HIDDEN_DIM + tid];
             }
-            int8_t qv = clip(aq>>8), kv = clip(ak>>8), vv = clip(av>>8);
+            ActType qv = clip(aq>>8), kv = clip(ak>>8), vv = clip(av>>8);
 
             // Store KV
-            int8_t *lkv = kv_cache + (l * kv_layer_stride);
+            ActType *lkv = kv_cache + (l * kv_layer_stride);
             lkv[t*HIDDEN_DIM + tid] = kv;
             lkv[total_len*HIDDEN_DIM + t*HIDDEN_DIM + tid] = vv;
             __syncthreads();
@@ -515,12 +528,12 @@ __global__ void generate_sequence_kernel(
             if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
             __syncthreads();
 
-            long long w_v_sum = 0;
-            long long tot_sc = 0;
+            AttnAccumType w_v_sum = 0;
+            AttnAccumType tot_sc = 0;
 
             for(int ctx=0; ctx <= t; ctx++) {
-                int8_t k_ctx = lkv[ctx*HIDDEN_DIM + tid];
-                long long df = (long long)qv * k_ctx;
+                ActType k_ctx = lkv[ctx*HIDDEN_DIM + tid];
+                AccumType df = (AccumType)qv * k_ctx;
                 for (int off = 16; off > 0; off /= 2) df += __shfl_down_sync(0xFFFFFFFF, df, off);
                 if ((tid % 32) == 0) atomicAdd((int32_t*)&s_scores[h*4], (int32_t)df);
                 __syncthreads();
@@ -529,59 +542,63 @@ __global__ void generate_sequence_kernel(
                 int idx = (sc >> 3) + 128; idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
                 int32_t wt = d_EXP2_TABLE[idx];
 
-                int8_t v_ctx = lkv[total_len*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
-                w_v_sum += (long long)wt * v_ctx;
+                ActType v_ctx = lkv[total_len*HIDDEN_DIM + ctx*HIDDEN_DIM + tid];
+                w_v_sum += (AttnAccumType)wt * v_ctx;
                 tot_sc += wt;
                 
                 if(tid < N_HEADS) ((int32_t*)s_scores)[tid] = 0;
                 __syncthreads();
             }
             if(tot_sc==0) tot_sc=1;
-            int8_t ao = clip(w_v_sum / tot_sc);
+            ActType ao = clip(w_v_sum / tot_sc);
             s_norm[tid] = ao; __syncthreads();
 
             // Output
-            const int8_t *wo = &model->w_o[l][0];
-            long long aco = 0;
-            for(int k=0; k<HIDDEN_DIM; k++) aco += (long long)s_norm[k] * wo[k*HIDDEN_DIM + tid];
-            s_x[tid] = clip((long long)s_x[tid] + (aco >> 8)); __syncthreads();
+            const WeightType *wo = &model->w_o[l][0];
+            AccumType aco = 0;
+            #pragma unroll 8
+            for(int k=0; k<HIDDEN_DIM; k++) aco += (AccumType)s_norm[k] * wo[k*HIDDEN_DIM + tid];
+            s_x[tid] = clip((AccumType)s_x[tid] + (aco >> 8)); __syncthreads();
 
             // MLP
-            long long mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-            long long mmn = mtot/HIDDEN_DIM; if(!mmn) mmn=1;
-            int8_t l2w = model->ln_2[l][tid];
-            int8_t n2x = clip(((long long)s_x[tid] * l2w) / mmn);
+            AccumType mtot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+            AccumType mmn = mtot/HIDDEN_DIM; if(!mmn) mmn=1;
+            WeightType l2w = model->ln_2[l][tid];
+            ActType n2x = clip(((AccumType)s_x[tid] * l2w) / mmn);
             s_norm[tid] = n2x; __syncthreads();
 
-            int8_t *s_mlp = &s_mem[2*HIDDEN_DIM + 256];
-            const int8_t *wup = &model->w_up[l][0];
+            ActType *s_mlp = &s_mem[2*HIDDEN_DIM + 256];
+            const WeightType *wup = &model->w_up[l][0];
             for(int sub=0; sub<4; sub++) {
                 int oidx = tid + sub*HIDDEN_DIM;
-                long long aup = 0;
-                for(int k=0; k<HIDDEN_DIM; k++) aup += (long long)s_norm[k] * wup[k*(4*HIDDEN_DIM) + oidx];
-                int8_t v = clip(aup>>8); if(v<0) v=0;
+                AccumType aup = 0;
+                #pragma unroll 8
+                for(int k=0; k<HIDDEN_DIM; k++) aup += (AccumType)s_norm[k] * wup[k*(4*HIDDEN_DIM) + oidx];
+                ActType v = clip(aup>>8); if(v<0) v=0;
                 s_mlp[oidx] = v;
             }
             __syncthreads();
 
-            const int8_t *wdn = &model->w_down[l][0];
-            long long adn = 0;
-            for(int k=0; k<(4*HIDDEN_DIM); k++) adn += (long long)s_mlp[k] * wdn[k*HIDDEN_DIM + tid];
-            s_x[tid] = clip((long long)s_x[tid] + (adn >> 9)); __syncthreads();
+            const WeightType *wdn = &model->w_down[l][0];
+            AccumType adn = 0;
+            #pragma unroll 8
+            for(int k=0; k<(4*HIDDEN_DIM); k++) adn += (AccumType)s_mlp[k] * wdn[k*HIDDEN_DIM + tid];
+            s_x[tid] = clip((AccumType)s_x[tid] + (adn >> 9)); __syncthreads();
         }
 
         // Final Head
-        long long ftot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
-        long long fmn = ftot/HIDDEN_DIM; if(!fmn) fmn=1;
-        int8_t lfw = model->ln_f[tid];
-        int8_t nf = clip(((long long)s_x[tid] * lfw) / fmn);
-        int8_t *s_norm = &s_mem[HIDDEN_DIM];
+        AccumType ftot = block_reduce_sum_broadcast(abs(s_x[tid]), temp_storage, shared_scalar);
+        AccumType fmn = ftot/HIDDEN_DIM; if(!fmn) fmn=1;
+        WeightType lfw = model->ln_f[tid];
+        ActType nf = clip(((AccumType)s_x[tid] * lfw) / fmn);
+        ActType *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
 
         if(tid < VOCAB_SIZE) {
-            long long ah = 0;
-            const int8_t *wh = &model->head[0];
-            for(int k=0; k<HIDDEN_DIM; k++) ah += (long long)s_norm[k] * wh[k*VOCAB_SIZE + tid];
+            AccumType ah = 0;
+            const WeightType *wh = &model->head[0];
+            #pragma unroll 8
+            for(int k=0; k<HIDDEN_DIM; k++) ah += (AccumType)s_norm[k] * wh[k*VOCAB_SIZE + tid];
             shared_logits[tid] = (int32_t)d_EXP2_TABLE[(int32_t)clip(ah>>8) + 128];
         }
         __syncthreads();
@@ -709,21 +726,21 @@ int main() {
             int d2 = HIDDEN_DIM*HIDDEN_DIM;
             
             // Layers
-            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (int8_t*)d_model->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base, d_fit, seed, thres);
-            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (int8_t*)d_model->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base, d_fit, seed, thres);
-            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (int8_t*)d_model->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base, d_fit, seed, thres);
-            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (int8_t*)d_model->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base, d_fit, seed, thres);
+            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base, d_fit, seed, thres);
+            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base, d_fit, seed, thres);
+            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base, d_fit, seed, thres);
+            update_matrix_kernel<<< (d2+511)/512, 512 >>>( (WeightType*)d_model->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base, d_fit, seed, thres);
             
-            update_matrix_kernel<<< (HIDDEN_DIM*4*HIDDEN_DIM+511)/512, 512 >>>( (int8_t*)d_model->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base, d_fit, seed, thres);
-            update_matrix_kernel<<< (4*HIDDEN_DIM*HIDDEN_DIM+511)/512, 512 >>>( (int8_t*)d_model->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base, d_fit, seed, thres);
+            update_matrix_kernel<<< (HIDDEN_DIM*4*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base, d_fit, seed, thres);
+            update_matrix_kernel<<< (4*HIDDEN_DIM*HIDDEN_DIM+511)/512, 512 >>>( (WeightType*)d_model->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base, d_fit, seed, thres);
             
-            update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>(d_model->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1, s_base, d_fit, seed, thres);
-            update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>(d_model->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2, s_base, d_fit, seed, thres);
+            update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1, s_base, d_fit, seed, thres);
+            update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2, s_base, d_fit, seed, thres);
         }
         
-        update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>(d_model->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, d_fit, seed, thres);
-        update_matrix_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512 >>>((int8_t*)d_model->head, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_HEAD, SEED_OFF_HEAD+VOCAB_SIZE, 0, d_fit, seed, thres);
-        update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, thres);
+        update_vector_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->ln_f, HIDDEN_DIM, SEED_OFF_LN_F, 0, d_fit, seed, thres);
+        update_matrix_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512 >>>((WeightType*)d_model->head, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_HEAD, SEED_OFF_HEAD+VOCAB_SIZE, 0, d_fit, seed, thres);
+        update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((WeightType*)d_model->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, thres);
         
         CHECK_CUDA(cudaDeviceSynchronize());
         clock_gettime(CLOCK_MONOTONIC, &t1);
