@@ -673,6 +673,26 @@ int main() {
         free(model);
         exit(1);
     }
+
+    // Bind model weights into a persistent Metal buffer so we avoid
+    // re-uploading large matrices on every kernel launch.
+    size_t embedding_size = (size_t)VOCAB_SIZE * (size_t)HIDDEN_DIM;
+    size_t gru_size       = (size_t)N_LAYERS * 4u * (size_t)HIDDEN_DIM * (size_t)HIDDEN_DIM;
+    size_t mlp_size       = (size_t)N_LAYERS * 2u * (size_t)HIDDEN_DIM * (size_t)(HIDDEN_DIM * 4);
+    size_t head_size      = (size_t)HIDDEN_DIM * (size_t)VOCAB_SIZE;
+
+    if (!egg_gpu_bind_model_weights(
+            model->embedding,                   embedding_size,
+            &model->gru_weights[0][0][0],      gru_size,
+            &model->mlp_weights[0][0][0],      mlp_size,
+            model->head,                       head_size
+        )) {
+        fprintf(stderr, "Error: failed to bind model weights to Metal.\n");
+        egg_gpu_metal_shutdown();
+        free(ds.data);
+        free(model);
+        exit(1);
+    }
 #endif
 
     uint32_t init_rng = 42;

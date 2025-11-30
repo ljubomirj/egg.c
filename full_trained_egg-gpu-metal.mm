@@ -33,12 +33,32 @@ typedef struct {
     NSUInteger noiseCapacity;
     id<MTLBuffer> paramsBuffer;
     id<MTLBuffer> updateParamsBuffer;
+    // Persistent model weights buffer (all large matrices live here).
+    id<MTLBuffer> modelBuffer;
+    NSUInteger modelCapacity;
+    struct {
+        const int8_t *embeddingHost;
+        NSUInteger    embeddingOffset;
+        NSUInteger    embeddingSize;
+        const int8_t *gruHost;
+        NSUInteger    gruOffset;
+        NSUInteger    gruSize;
+        const int8_t *mlpHost;
+        NSUInteger    mlpOffset;
+        NSUInteger    mlpSize;
+        const int8_t *headHost;
+        NSUInteger    headOffset;
+        NSUInteger    headSize;
+        bool          bound;
+    } modelLayout;
+    // Temporary buffers for ES update (noise and per-call weight tiles)
     id<MTLBuffer> updateWeightsBuffer;
-    NSUInteger updateWeightsCapacity;
+    NSUInteger    updateWeightsCapacity;
+    // Temporary noise/vote buffers for update_matrix
     id<MTLBuffer> updateABuffer;
-    NSUInteger updateACapacity;
+    NSUInteger    updateACapacity;
     id<MTLBuffer> updateBBuffer;
-    NSUInteger updateBCapacity;
+    NSUInteger    updateBCapacity;
     dispatch_semaphore_t lock;
 } EggMetalContext;
 
@@ -144,6 +164,28 @@ static void EggLogError(const char *label, NSError *error) {
     fprintf(stderr, "[EGG METAL] %s failed: %s\n", label, error.localizedDescription.UTF8String);
 }
 
+static bool EggResolveModelWeightOffset(const int8_t *hostPtr, NSUInteger *offsetOut) {
+    if (!g_ctx.modelLayout.bound) return false;
+    auto &ml = g_ctx.modelLayout;
+    if (ml.embeddingHost && hostPtr >= ml.embeddingHost && hostPtr < ml.embeddingHost + ml.embeddingSize) {
+        *offsetOut = ml.embeddingOffset + (NSUInteger)(hostPtr - ml.embeddingHost);
+        return true;
+    }
+    if (ml.gruHost && hostPtr >= ml.gruHost && hostPtr < ml.gruHost + ml.gruSize) {
+        *offsetOut = ml.gruOffset + (NSUInteger)(hostPtr - ml.gruHost);
+        return true;
+    }
+    if (ml.mlpHost && hostPtr >= ml.mlpHost && hostPtr < ml.mlpHost + ml.mlpSize) {
+        *offsetOut = ml.mlpOffset + (NSUInteger)(hostPtr - ml.mlpHost);
+        return true;
+    }
+    if (ml.headHost && hostPtr >= ml.headHost && hostPtr < ml.headHost + ml.headSize) {
+        *offsetOut = ml.headOffset + (NSUInteger)(hostPtr - ml.headHost);
+        return true;
+    }
+    return false;
+}
+
 extern "C" bool egg_gpu_metal_init(void) {
     @autoreleasepool {
         if (g_ctx.ready) return true;
@@ -210,6 +252,90 @@ extern "C" bool egg_gpu_metal_init(void) {
     }
 }
 
+extern "C" bool egg_gpu_bind_model_weights(
+    const int8_t *embedding,  size_t embedding_size,
+    const int8_t *gru_weights, size_t gru_size,
+    const int8_t *mlp_weights, size_t mlp_size,
+    const int8_t *head,       size_t head_size
+) {
+    if (!g_ctx.ready) {
+        if (!egg_gpu_metal_init()) {
+            return false;
+        }
+    }
+
+    if (!embedding || !gru_weights || !mlp_weights || !head) {
+        fprintf(stderr, "[EGG METAL] Invalid model pointers in egg_gpu_bind_model_weights.\n");
+        return false;
+    }
+
+    NSUInteger embBytes = (NSUInteger)embedding_size;
+    NSUInteger gruBytes = (NSUInteger)gru_size;
+    NSUInteger mlpBytes = (NSUInteger)mlp_size;
+    NSUInteger headBytes = (NSUInteger)head_size;
+    NSUInteger totalBytes = embBytes + gruBytes + mlpBytes + headBytes;
+    if (totalBytes == 0) {
+        fprintf(stderr, "[EGG METAL] Zero-sized model in egg_gpu_bind_model_weights.\n");
+        return false;
+    }
+
+    dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    @autoreleasepool {
+        // Ensure model buffer is large enough.
+        id<MTLBuffer> modelBuffer = g_ctx.modelBuffer;
+        if (!modelBuffer || g_ctx.modelCapacity < totalBytes) {
+            g_ctx.modelBuffer = [g_ctx.device newBufferWithLength:totalBytes
+                                                          options:MTLResourceStorageModeShared];
+            if (!g_ctx.modelBuffer) {
+                fprintf(stderr, "[EGG METAL] Failed to allocate model buffer (%zu bytes).\n",
+                        (size_t)totalBytes);
+                g_ctx.modelCapacity = 0;
+                dispatch_semaphore_signal(g_ctx.lock);
+                return false;
+            }
+            g_ctx.modelCapacity = totalBytes;
+        }
+
+        uint8_t *base = static_cast<uint8_t *>([g_ctx.modelBuffer contents]);
+        if (!base) {
+            fprintf(stderr, "[EGG METAL] modelBuffer has no contents.\n");
+            dispatch_semaphore_signal(g_ctx.lock);
+            return false;
+        }
+
+        // Lay out sub-ranges.
+        NSUInteger off = 0;
+        g_ctx.modelLayout.embeddingHost   = embedding;
+        g_ctx.modelLayout.embeddingOffset = off;
+        g_ctx.modelLayout.embeddingSize   = embBytes;
+        memcpy(base + off, embedding, embBytes);
+        off += embBytes;
+
+        g_ctx.modelLayout.gruHost   = gru_weights;
+        g_ctx.modelLayout.gruOffset = off;
+        g_ctx.modelLayout.gruSize   = gruBytes;
+        memcpy(base + off, gru_weights, gruBytes);
+        off += gruBytes;
+
+        g_ctx.modelLayout.mlpHost   = mlp_weights;
+        g_ctx.modelLayout.mlpOffset = off;
+        g_ctx.modelLayout.mlpSize   = mlpBytes;
+        memcpy(base + off, mlp_weights, mlpBytes);
+        off += mlpBytes;
+
+        g_ctx.modelLayout.headHost   = head;
+        g_ctx.modelLayout.headOffset = off;
+        g_ctx.modelLayout.headSize   = headBytes;
+        memcpy(base + off, head, headBytes);
+
+        g_ctx.modelLayout.bound = true;
+    }
+    dispatch_semaphore_signal(g_ctx.lock);
+    fprintf(stdout, "[EGG METAL] Bound model weights into GPU buffer (%zu bytes).\n",
+            (size_t)g_ctx.modelCapacity);
+    return true;
+}
+
 extern "C" void egg_gpu_metal_shutdown(void) {
     g_ctx.ready = false;
     g_ctx.inputBuffer = nil;
@@ -218,10 +344,25 @@ extern "C" void egg_gpu_metal_shutdown(void) {
     g_ctx.noiseBuffer = nil;
     g_ctx.paramsBuffer = nil;
     g_ctx.updateParamsBuffer = nil;
+    g_ctx.modelBuffer = nil;
+    g_ctx.modelCapacity = 0;
+    g_ctx.modelLayout.embeddingHost = nullptr;
+    g_ctx.modelLayout.embeddingOffset = 0;
+    g_ctx.modelLayout.embeddingSize = 0;
+    g_ctx.modelLayout.gruHost = nullptr;
+    g_ctx.modelLayout.gruOffset = 0;
+    g_ctx.modelLayout.gruSize = 0;
+    g_ctx.modelLayout.mlpHost = nullptr;
+    g_ctx.modelLayout.mlpOffset = 0;
+    g_ctx.modelLayout.mlpSize = 0;
+    g_ctx.modelLayout.headHost = nullptr;
+    g_ctx.modelLayout.headOffset = 0;
+    g_ctx.modelLayout.headSize = 0;
+    g_ctx.modelLayout.bound = false;
     g_ctx.updateWeightsBuffer = nil;
+    g_ctx.updateWeightsCapacity = 0;
     g_ctx.updateABuffer = nil;
     g_ctx.updateBBuffer = nil;
-    g_ctx.updateWeightsCapacity = 0;
     g_ctx.updateACapacity = 0;
     g_ctx.updateBCapacity = 0;
     g_ctx.matmulPipeline = nil;
@@ -251,14 +392,12 @@ extern "C" bool egg_gpu_matmul_perturbed(
 
     dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
     @autoreleasepool {
-        NSUInteger inputBytes = (NSUInteger)cols;
-        NSUInteger weightBytes = (NSUInteger)rows * (NSUInteger)cols;
+        NSUInteger inputBytes  = (NSUInteger)cols;
         NSUInteger outputBytes = (NSUInteger)rows;
 
-        id<MTLBuffer> inputBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.inputBuffer, &g_ctx.inputCapacity, inputBytes);
-        id<MTLBuffer> weightBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.weightBuffer, &g_ctx.weightCapacity, weightBytes);
+        id<MTLBuffer> inputBuffer  = EggEnsureBuffer(g_ctx.device, &g_ctx.inputBuffer, &g_ctx.inputCapacity, inputBytes);
         id<MTLBuffer> outputBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.outputBuffer, &g_ctx.outputCapacity, outputBytes);
-        id<MTLBuffer> noiseBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.noiseBuffer, &g_ctx.noiseCapacity, outputBytes);
+        id<MTLBuffer> noiseBuffer  = EggEnsureBuffer(g_ctx.device, &g_ctx.noiseBuffer, &g_ctx.noiseCapacity, outputBytes);
         id<MTLBuffer> paramsBuffer = g_ctx.paramsBuffer;
         if (!paramsBuffer) {
             paramsBuffer = [g_ctx.device newBufferWithLength:sizeof(EggMetalMatmulParams)
@@ -266,14 +405,13 @@ extern "C" bool egg_gpu_matmul_perturbed(
             g_ctx.paramsBuffer = paramsBuffer;
         }
 
-        if (!inputBuffer || !weightBuffer || !outputBuffer || !noiseBuffer || !paramsBuffer) {
+        if (!inputBuffer || !outputBuffer || !noiseBuffer || !paramsBuffer) {
             dispatch_semaphore_signal(g_ctx.lock);
             fprintf(stderr, "[EGG METAL] Failed to allocate buffers for matmul.\n");
             return false;
         }
 
         memcpy([inputBuffer contents], input, inputBytes);
-        memcpy([weightBuffer contents], weights, weightBytes);
         memcpy([noiseBuffer contents], noise_a, outputBytes);
 
         EggMetalMatmulParams params = {};
@@ -294,7 +432,22 @@ extern "C" bool egg_gpu_matmul_perturbed(
 
         [encoder setComputePipelineState:g_ctx.matmulPipeline];
         [encoder setBuffer:inputBuffer offset:0 atIndex:0];
-        [encoder setBuffer:weightBuffer offset:0 atIndex:1];
+
+        // Prefer using the persistent model buffer when possible.
+        NSUInteger wOffset = 0;
+        if (g_ctx.modelBuffer && EggResolveModelWeightOffset(weights, &wOffset)) {
+            [encoder setBuffer:g_ctx.modelBuffer offset:wOffset atIndex:1];
+        } else {
+            NSUInteger weightBytes = (NSUInteger)rows * (NSUInteger)cols;
+            id<MTLBuffer> weightBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.weightBuffer, &g_ctx.weightCapacity, weightBytes);
+            if (!weightBuffer) {
+                dispatch_semaphore_signal(g_ctx.lock);
+                fprintf(stderr, "[EGG METAL] Failed to allocate weight buffer.\n");
+                return false;
+            }
+            memcpy([weightBuffer contents], weights, weightBytes);
+            [encoder setBuffer:weightBuffer offset:0 atIndex:1];
+        }
         [encoder setBuffer:outputBuffer offset:0 atIndex:2];
         [encoder setBuffer:noiseBuffer offset:0 atIndex:3];
         [encoder setBuffer:paramsBuffer offset:0 atIndex:4];
@@ -388,7 +541,19 @@ extern "C" bool egg_gpu_update_matrix(
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
 
+        // Synchronize updated weights back to host memory.
         memcpy(weights, [weightBuffer contents], weightBytes);
+
+        // Keep the persistent model buffer in sync if this matrix is part of it.
+        if (g_ctx.modelBuffer && g_ctx.modelLayout.bound) {
+            NSUInteger wOffset = 0;
+            if (EggResolveModelWeightOffset(weights, &wOffset)) {
+                uint8_t *base = static_cast<uint8_t *>([g_ctx.modelBuffer contents]);
+                if (base && wOffset + weightBytes <= g_ctx.modelCapacity) {
+                    memcpy(base + wOffset, [weightBuffer contents], weightBytes);
+                }
+            }
+        }
     }
     dispatch_semaphore_signal(g_ctx.lock);
     return true;

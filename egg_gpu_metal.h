@@ -32,6 +32,15 @@ bool egg_gpu_update_matrix(
     int pairs
 );
 
+// Bind host-side model weights into a single persistent Metal buffer.
+// Sizes are in bytes and should match the lengths of the corresponding arrays.
+bool egg_gpu_bind_model_weights(
+    const int8_t *embedding,  size_t embedding_size,
+    const int8_t *gru_weights, size_t gru_size,
+    const int8_t *mlp_weights, size_t mlp_size,
+    const int8_t *head,       size_t head_size
+);
+
 #ifdef __cplusplus
 }
 #endif
