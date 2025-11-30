@@ -22,6 +22,7 @@ typedef struct {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> matmulPipeline;
+    id<MTLComputePipelineState> updatePipeline;
     id<MTLBuffer> inputBuffer;
     NSUInteger inputCapacity;
     id<MTLBuffer> weightBuffer;
@@ -31,12 +32,28 @@ typedef struct {
     id<MTLBuffer> noiseBuffer;
     NSUInteger noiseCapacity;
     id<MTLBuffer> paramsBuffer;
+    id<MTLBuffer> updateParamsBuffer;
+    id<MTLBuffer> updateWeightsBuffer;
+    NSUInteger updateWeightsCapacity;
+    id<MTLBuffer> updateABuffer;
+    NSUInteger updateACapacity;
+    id<MTLBuffer> updateBBuffer;
+    NSUInteger updateBCapacity;
     dispatch_semaphore_t lock;
 } EggMetalContext;
 
 static EggMetalContext g_ctx = {};
 
-static NSString *EggMetalMatmulSource(void) {
+typedef struct {
+    int32_t rows;
+    int32_t cols;
+    int32_t pairs;
+    int32_t strideA;
+    int32_t strideB;
+    int32_t threshold;
+} EggMetalUpdateParams;
+
+static NSString *EggMetalShaderSource(void) {
     return [NSString stringWithFormat:
         @"#include <metal_stdlib>\n"
          "using namespace metal;\n"
@@ -50,6 +67,14 @@ static NSString *EggMetalMatmulSource(void) {
          "  int shift;\n"
          "  int noise_sign;\n"
          "  int xB;\n"
+         "};\n"
+         "struct EggMetalUpdateParams {\n"
+         "  int rows;\n"
+         "  int cols;\n"
+         "  int pairs;\n"
+         "  int strideA;\n"
+         "  int strideB;\n"
+         "  int threshold;\n"
          "};\n"
          "kernel void egg_matmul_perturbed_kernel(\n"
          "    device const char *input [[buffer(0)]],\n"
@@ -72,6 +97,29 @@ static NSString *EggMetalMatmulSource(void) {
          "  res = min(res, MAX_VAL);\n"
          "  res = max(res, MIN_VAL);\n"
          "  output[gid] = char(res);\n"
+         "}\n"
+         "kernel void egg_update_matrix_kernel(\n"
+         "    device char *weights [[buffer(0)]],\n"
+         "    device const char *A_T [[buffer(1)]],\n"
+         "    device const char *B_T [[buffer(2)]],\n"
+         "    constant EggMetalUpdateParams &params [[buffer(3)]],\n"
+         "    uint gid [[thread_position_in_grid]]) {\n"
+         "  int total = params.rows * params.cols;\n"
+         "  if (gid >= total) { return; }\n"
+         "  int r = gid / params.cols;\n"
+         "  int c = gid %% params.cols;\n"
+         "  const device char *a_ptr = A_T + r * params.strideA;\n"
+         "  const device char *b_ptr = B_T + c * params.strideB;\n"
+         "  int vote = 0;\n"
+         "  for (int p = 0; p < params.pairs; ++p) {\n"
+         "    vote += int(a_ptr[p]) * int(b_ptr[p]);\n"
+         "  }\n"
+         "  device char *w_ptr = weights + gid;\n"
+         "  if (vote > params.threshold && *w_ptr < MAX_VAL) {\n"
+         "    (*w_ptr)++;\n"
+         "  } else if (vote < -params.threshold && *w_ptr > MIN_VAL) {\n"
+         "    (*w_ptr)--;\n"
+         "  }\n"
          "}\n",
         FIXED_POINT,
         SIGMA_SHIFT,
@@ -112,7 +160,7 @@ extern "C" bool egg_gpu_metal_init(void) {
         }
 
         NSError *error = nil;
-        NSString *source = EggMetalMatmulSource();
+        NSString *source = EggMetalShaderSource();
         id<MTLLibrary> library = [g_ctx.device newLibraryWithSource:source options:nil error:&error];
         if (!library) {
             EggLogError("newLibraryWithSource", error);
@@ -137,6 +185,24 @@ extern "C" bool egg_gpu_metal_init(void) {
             return false;
         }
 
+        id<MTLFunction> updateFunction = [library newFunctionWithName:@"egg_update_matrix_kernel"];
+        if (!updateFunction) {
+            fprintf(stderr, "[EGG METAL] Failed to create update kernel function.\n");
+            g_ctx.queue = nil;
+            g_ctx.device = nil;
+            g_ctx.matmulPipeline = nil;
+            return false;
+        }
+
+        g_ctx.updatePipeline = [g_ctx.device newComputePipelineStateWithFunction:updateFunction error:&error];
+        if (!g_ctx.updatePipeline) {
+            EggLogError("newComputePipelineStateWithFunction(update)", error);
+            g_ctx.queue = nil;
+            g_ctx.device = nil;
+            g_ctx.matmulPipeline = nil;
+            return false;
+        }
+
         g_ctx.lock = dispatch_semaphore_create(1);
         g_ctx.ready = true;
         fprintf(stdout, "[EGG METAL] Initialized on device: %s\n", g_ctx.device.name.UTF8String);
@@ -151,7 +217,15 @@ extern "C" void egg_gpu_metal_shutdown(void) {
     g_ctx.outputBuffer = nil;
     g_ctx.noiseBuffer = nil;
     g_ctx.paramsBuffer = nil;
+    g_ctx.updateParamsBuffer = nil;
+    g_ctx.updateWeightsBuffer = nil;
+    g_ctx.updateABuffer = nil;
+    g_ctx.updateBBuffer = nil;
+    g_ctx.updateWeightsCapacity = 0;
+    g_ctx.updateACapacity = 0;
+    g_ctx.updateBCapacity = 0;
     g_ctx.matmulPipeline = nil;
+    g_ctx.updatePipeline = nil;
     g_ctx.queue = nil;
     g_ctx.device = nil;
     g_ctx.inputCapacity = 0;
@@ -238,6 +312,83 @@ extern "C" bool egg_gpu_matmul_perturbed(
         [commandBuffer waitUntilCompleted];
 
         memcpy(output, [outputBuffer contents], outputBytes);
+    }
+    dispatch_semaphore_signal(g_ctx.lock);
+    return true;
+}
+
+extern "C" bool egg_gpu_update_matrix(
+    int8_t *weights,
+    const int8_t *A_T,
+    const int8_t *B_T,
+    int rows,
+    int cols,
+    int pairs
+) {
+    if (!g_ctx.ready || !g_ctx.updatePipeline) return false;
+    if (rows <= 0 || cols <= 0 || pairs <= 0) return false;
+
+    dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    @autoreleasepool {
+        NSUInteger weightBytes = (NSUInteger)rows * (NSUInteger)cols;
+        NSUInteger stridePairs = MAX_POP_PAIRS;
+        NSUInteger aBytes = (NSUInteger)rows * stridePairs;
+        NSUInteger bBytes = (NSUInteger)cols * stridePairs;
+
+        id<MTLBuffer> weightBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.updateWeightsBuffer, &g_ctx.updateWeightsCapacity, weightBytes);
+        id<MTLBuffer> aBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.updateABuffer, &g_ctx.updateACapacity, aBytes);
+        id<MTLBuffer> bBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.updateBBuffer, &g_ctx.updateBCapacity, bBytes);
+        if (!g_ctx.updateParamsBuffer) {
+            g_ctx.updateParamsBuffer = [g_ctx.device newBufferWithLength:sizeof(EggMetalUpdateParams)
+                                                                 options:MTLResourceStorageModeShared];
+        }
+
+        if (!weightBuffer || !aBuffer || !bBuffer || !g_ctx.updateParamsBuffer) {
+            dispatch_semaphore_signal(g_ctx.lock);
+            fprintf(stderr, "[EGG METAL] Failed to allocate buffers for update_matrix.\n");
+            return false;
+        }
+
+        memcpy([weightBuffer contents], weights, weightBytes);
+        memcpy([aBuffer contents], A_T, aBytes);
+        memcpy([bBuffer contents], B_T, bBytes);
+
+        EggMetalUpdateParams params = {};
+        params.rows = rows;
+        params.cols = cols;
+        params.pairs = pairs;
+        params.strideA = (int32_t)stridePairs;
+        params.strideB = (int32_t)stridePairs;
+        params.threshold = UPDATE_THRESHOLD;
+        memcpy([g_ctx.updateParamsBuffer contents], &params, sizeof(EggMetalUpdateParams));
+
+        id<MTLCommandBuffer> commandBuffer = [g_ctx.queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        if (!encoder) {
+            dispatch_semaphore_signal(g_ctx.lock);
+            fprintf(stderr, "[EGG METAL] Failed to create compute encoder for update.\n");
+            return false;
+        }
+
+        [encoder setComputePipelineState:g_ctx.updatePipeline];
+        [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+        [encoder setBuffer:aBuffer offset:0 atIndex:1];
+        [encoder setBuffer:bBuffer offset:0 atIndex:2];
+        [encoder setBuffer:g_ctx.updateParamsBuffer offset:0 atIndex:3];
+
+        NSUInteger total = (NSUInteger)rows * (NSUInteger)cols;
+        NSUInteger maxThreads = g_ctx.updatePipeline.maxTotalThreadsPerThreadgroup;
+        if (maxThreads < 1) maxThreads = 1;
+        NSUInteger threadsPerGroup = maxThreads < 256 ? maxThreads : 256;
+        MTLSize gridSize = MTLSizeMake(total, 1, 1);
+        MTLSize threadgroupSize = MTLSizeMake(threadsPerGroup, 1, 1);
+
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        memcpy(weights, [weightBuffer contents], weightBytes);
     }
     dispatch_semaphore_signal(g_ctx.lock);
     return true;

@@ -521,6 +521,19 @@ void update_matrix(
         }
     }
 
+    bool gpu_handled = false;
+#if defined(EGG_USE_METAL)
+    gpu_handled = egg_gpu_update_matrix(
+        W,
+        (const int8_t *)A_T,
+        (const int8_t *)B_T,
+        rows,
+        cols,
+        pairs
+    );
+#endif
+    if (gpu_handled) return;
+
     // 2. Compute Votes and Update Weights (Single Pass)
     for(int r=0; r<rows; r++) {
         int8_t *w_row = &W[r * cols];

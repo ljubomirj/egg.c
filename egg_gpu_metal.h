@@ -23,6 +23,15 @@ bool egg_gpu_matmul_perturbed(
     int32_t xB
 );
 
+bool egg_gpu_update_matrix(
+    int8_t *weights,
+    const int8_t *A_T,
+    const int8_t *B_T,
+    int rows,
+    int cols,
+    int pairs
+);
+
 #ifdef __cplusplus
 }
 #endif
