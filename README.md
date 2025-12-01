@@ -48,8 +48,10 @@ The GPU-oriented entry point is:
 The Metal runtime is implemented in `full_trained_egg-gpu-metal.mm` and wired through a small C API in `egg_gpu_metal.h`. When you build:
 
 ```bash
-make egg-gpumetal
+make egg-gpu-macos-metal
 ```
+
+**Note**: The target name was updated from `egg-gpumetal` to `egg-gpu-macos-metal` for consistency with other targets (`egg-cpu-macos-arm64`, `egg-cpu-linux-amd64`, etc.).
 
 the build system:
 
@@ -87,12 +89,27 @@ This design keeps the math identical to the CPU path, but it is **not yet optimi
 
 ### Practical Notes for Metal Training
 
+**⚠️ Performance Warning**: The Metal GPU backend (`egg-gpu-macos-metal`) is currently **significantly slower than the CPU version** (~5 minutes per step vs ~10 seconds on CPU). This is due to:
+
+1. **Many small kernel launches**: Hundreds of small GPU kernels per forward pass, where kernel launch overhead dominates execution time.
+2. **CPU SIMD efficiency**: The CPU version (`egg-cpu-macos-arm64`) uses NEON SIMD intrinsics that process everything efficiently in a single pass, which is well-suited for this workload pattern.
+3. **GPU architecture mismatch**: GPUs excel at large parallel workloads, but this model has many sequential small operations that don't fully utilize GPU parallelism.
+
+**Recommendation**: Use `egg-cpu-macos-arm64` for training on Apple Silicon. The Metal GPU path remains available for experimentation and future optimization work, but requires significant restructuring (kernel fusion, larger workgroups, operation batching) to be competitive.
+
+To disable GPU and force CPU path even when Metal is available:
+```bash
+EGG_DISABLE_GPU=1 ./egg-gpu-macos-metal
+```
+
 - For **quick experiments** on Apple Silicon, it is strongly recommended to:
-  - Reduce `SEQ_LEN` and `POPULATION_SIZE` in `egg_config.h`.
+  - Use `egg-cpu-macos-arm64` for best performance.
+  - If testing GPU path, reduce `SEQ_LEN` and `POPULATION_SIZE` in `egg_config.h`.
   - Optionally train on a truncated `input.txt` (e.g. a few MB) to see steps advancing more quickly.
-- For **long runs**, keep in mind the current Metal backend is correctness-oriented; to make it truly faster than `egg-macos-arm64`, the next steps are:
-  - Keep model weights live on the GPU instead of copying them for each matmul.
+- For **long runs**, keep in mind the current Metal backend is correctness-oriented; to make it truly faster than `egg-cpu-macos-arm64`, the next steps are:
+  - Keep model weights live on the GPU instead of copying them for each matmul (✅ already implemented).
   - Batch more work into each kernel launch (e.g. multiple gates/layers/timesteps at once).
+  - Fuse operations (e.g., layer norm + matmul) into single kernels to reduce launch overhead.
   - Gradually move GRU/LN glue and population evaluation onto the device.
 
 ## References

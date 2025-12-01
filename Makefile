@@ -9,11 +9,9 @@ EGG_GPU_METAL_SRC := full_trained_egg-gpu-metal.mm
 EGG_GPU_METAL_OBJ := full_trained_egg-gpumulti-metal.o
 EGG_GPU_METAL_MM_OBJ := full_trained_egg-gpu-metal.o
 
-.PHONY: all egg egg-linux-amd64 egg-macos-arm64 egg-cpumulti \
-	egg-gpumetal egg-gpurocm egg-gpucuda \
-	egg-gpuvulcan clean gpu-targets
+.PHONY: all clean gpu-targets
 
-all: egg egg-linux-amd64 egg-macos-arm64 egg-cpumulti egg-gpumetal 
+all: egg egg-cpu-linux-amd64 egg-cpu-macos-arm64 egg-cpumulti egg-gpu-macos-metal 
 
 egg: $(EGG_SRC)
 ifeq ($(UNAME_S),Darwin)
@@ -24,7 +22,7 @@ else
 	@echo "Target $@ is only supported on macOS."
 endif
 
-egg-macos-arm64: $(EGG_CPU_MULTI_SRC)
+egg-cpu-macos-arm64: $(EGG_CPU_MULTI_SRC)
 ifeq ($(UNAME_S),Darwin)
 	@echo "==> $@ Building..."
 	$(CC) -O3 -DEGG_FORCE_NEON $(EGG_CPU_MULTI_SRC) -lm -o $@
@@ -33,7 +31,7 @@ else
 	@echo "Target $@ is only supported on macOS, while this is $(UNAME_S)"
 endif
 
-egg-linux-amd64: $(EGG_CPU_MULTI_SRC)
+egg-cpu-linux-amd64: $(EGG_CPU_MULTI_SRC)
 ifeq ($(UNAME_S),Linux)
 	@echo "==> $@ Building..."
 	$(CXX) -O3 -mavx2 -mfma -fopenmp -DEGG_FORCE_AVX2 $(EGG_CPU_MULTI_SRC) -lm -o $@
@@ -49,7 +47,7 @@ egg-cpumulti: $(EGG_CPU_MULTI_SRC)
 
 GPU_STUB_FLAGS := -O2 $(EGG_GPU_MULTI_SRC)
 
-egg-gpumetal: $(EGG_GPU_MULTI_SRC) $(EGG_GPU_METAL_SRC)
+egg-gpu-macos-metal: $(EGG_GPU_MULTI_SRC) $(EGG_GPU_METAL_SRC)
 ifeq ($(UNAME_S),Darwin)
 	@echo "==> $@ Metal training build building..."
 	$(CC) -O2 -c -DEGG_BUILD_METAL \
@@ -63,25 +61,25 @@ else
 	@echo "Target $@ is only supported on macOS, while this is $(UNAME_S)"
 endif
 
-egg-gpurocm: $(EGG_GPU_MULTI_SRC)
+egg-gpu-linux-rocm: $(EGG_GPU_MULTI_SRC)
 	@echo "==> $@ ROCm stub building..."
 	$(CC) $(GPU_STUB_FLAGS) -DEGG_GPU_BACKEND=EGG_GPU_BACKEND_ROCM -o $@
 	@echo "[$@ done]"
 
-egg-gpucuda: $(EGG_GPU_MULTI_SRC)
+egg-gpu-linux-cuda: $(EGG_GPU_MULTI_SRC)
 	@echo "==> $@ CUDA stub building..."
 	$(CC) $(GPU_STUB_FLAGS) -DEGG_GPU_BACKEND=EGG_GPU_BACKEND_CUDA -o $@
 	@echo "[$@ done]"
 
-egg-gpuvulcan: $(EGG_GPU_MULTI_SRC)
+egg-gpu-linux-vulcan: $(EGG_GPU_MULTI_SRC)
 	@echo "==> $@ Vulkan stub building..."
 	$(CC) $(GPU_STUB_FLAGS) -DEGG_GPU_BACKEND=EGG_GPU_BACKEND_VULKAN -o $@
 	@echo "[$@ done]"
 
-gpu-targets: egg-gpumetal egg-gpurocm egg-gpucuda egg-gpuvulcan
+gpu-targets: egg-gpu-macos-metal egg-gpu-linux-rocm egg-gpu-linux-cuda egg-gpu-linux-vulcan
 
 clean:
-	rm -f egg egg-linux-amd64 egg-macos-arm64 egg-cpumulti egg-gpumetal \
-		egg-gpurocm egg-gpucuda egg-gpuvulcan \
+	rm -f egg egg-cpu-linux-amd64 egg-cpu-macos-arm64 egg-cpumulti egg-gpu-macos-metal \
+		egg-gpu-linux-rocm egg-gpu-linux-cuda egg-gpu-linux-vulcan \
 		$(EGG_GPU_METAL_OBJ) $(EGG_GPU_METAL_MM_OBJ)
 

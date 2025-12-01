@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <limits.h>
+#include <unistd.h>
 
 #if defined(EGG_USE_METAL)
 #include "egg_gpu_metal.h"
@@ -98,22 +99,67 @@ static bool has_zstd_extension(const char *filename) {
            ends_with_ignore_case(filename, ".zstd");
 }
 
-static FILE *open_dataset_stream(const char *filename, bool *is_pipe) {
+static FILE *open_dataset_stream(const char *filename, bool *is_pipe, char *resolved_out, size_t resolved_size) {
     *is_pipe = has_zstd_extension(filename);
-    if (!*is_pipe) return fopen(filename, "rb");
-
-    if (strchr(filename, '\'')) {
-        fprintf(stderr, "Error: filename '%s' contains a single quote; cannot safely stream.\n", filename);
-        return NULL;
-    }
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
-    char cmd[PATH_MAX + 32];
-    int written = snprintf(cmd, sizeof(cmd), "zstd -dc -- '%s'", filename);
+    const char *actual_path = filename;
+
+    // If it's a compressed file, resolve to canonical path first (zstd refuses symlinks)
+    if (*is_pipe) {
+        char resolved[PATH_MAX];
+        const char *canonical = realpath(filename, resolved);
+        if (!canonical) {
+            fprintf(stderr, "Error: failed to resolve canonical path for '%s'.\n", filename);
+            return NULL;
+        }
+        actual_path = canonical;
+        // Copy resolved path to caller if requested
+        if (resolved_out && resolved_size > 0) {
+            strncpy(resolved_out, actual_path, resolved_size - 1);
+            resolved_out[resolved_size - 1] = '\0';
+        }
+    } else {
+        // For non-compressed files, optionally resolve for display purposes
+        if (resolved_out && resolved_size > 0) {
+            char resolved[PATH_MAX];
+            const char *canonical = realpath(filename, resolved);
+            if (canonical) {
+                strncpy(resolved_out, canonical, resolved_size - 1);
+                resolved_out[resolved_size - 1] = '\0';
+            } else {
+                strncpy(resolved_out, filename, resolved_size - 1);
+                resolved_out[resolved_size - 1] = '\0';
+            }
+        }
+        return fopen(filename, "rb");
+    }
+
+    // Now actual_path is the canonical path (guaranteed non-symlink)
+    // Build command with proper shell escaping
+    char cmd[PATH_MAX + 64];
+    // Escape single quotes by replacing ' with '\'' (end quote, escaped quote, start quote)
+    char escaped[PATH_MAX * 2];
+    const char *src = actual_path;
+    char *dst = escaped;
+    while (*src && (dst - escaped) < (int)sizeof(escaped) - 4) {
+        if (*src == '\'') {
+            *dst++ = '\'';
+            *dst++ = '\\';
+            *dst++ = '\'';
+            *dst++ = '\'';
+        } else {
+            *dst++ = *src;
+        }
+        src++;
+    }
+    *dst = '\0';
+    
+    int written = snprintf(cmd, sizeof(cmd), "zstd -dc -- '%s'", escaped);
     if (written < 0 || written >= (int)sizeof(cmd)) {
-        fprintf(stderr, "Error: command too long for filename '%s'.\n", filename);
+        fprintf(stderr, "Error: command too long for filename '%s'.\n", actual_path);
         return NULL;
     }
 
@@ -338,8 +384,307 @@ void forward_pass(
     
     if(accumulated_loss) *accumulated_loss = 0;
 
+#if defined(EGG_USE_METAL)
+    // Begin batching GPU operations for this forward pass
+    // Note: GPU path is currently slower than CPU due to many small kernel launches
+    // Set EGG_DISABLE_GPU=1 to force CPU path even when Metal is available
+    static bool gpu_disabled = false;
+    static bool gpu_disabled_checked = false;
+    if (!gpu_disabled_checked) {
+        const char *env = getenv("EGG_DISABLE_GPU");
+        gpu_disabled = (env && env[0] == '1');
+        gpu_disabled_checked = true;
+    }
+    if (!gpu_disabled) {
+        egg_gpu_batch_begin();
+    }
+#endif
+
     for(int t=0; t<seq_len; t++) {
         // Embedding
+#if defined(EGG_USE_METAL)
+        // Try GPU path: use GPU buffers throughout
+        static void *gpu_embedding_buffer = NULL;
+        static void *gpu_work_buffers[10] = {NULL}; // Reusable buffers (need more for MLP)
+        static void *gpu_mlp_large_buffer = NULL; // For HIDDEN_DIM * 4
+        static void *gpu_noise_buffers[4] = {NULL}; // Reusable noise buffers
+        static bool buffers_allocated = false;
+        
+        if (!buffers_allocated) {
+            // Allocate reusable GPU buffers once
+            gpu_embedding_buffer = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            for (int i = 0; i < 10; i++) {
+                gpu_work_buffers[i] = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            }
+            gpu_mlp_large_buffer = egg_gpu_alloc_temp_buffer(HIDDEN_DIM * 4);
+            for (int i = 0; i < 4; i++) {
+                gpu_noise_buffers[i] = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            }
+            buffers_allocated = (gpu_embedding_buffer != NULL && gpu_mlp_large_buffer != NULL);
+            for (int i = 0; i < 10; i++) {
+                if (!gpu_work_buffers[i]) buffers_allocated = false;
+            }
+            for (int i = 0; i < 4; i++) {
+                if (!gpu_noise_buffers[i]) buffers_allocated = false;
+            }
+        }
+        
+        if (!gpu_disabled && buffers_allocated && gpu_embedding_buffer) {
+            // Copy embedding row to GPU
+            egg_gpu_copy_to_buffer(gpu_embedding_buffer, &model->embedding[inputs[t] * HIDDEN_DIM], HIDDEN_DIM);
+            
+            // Keep CPU copy for xB computations (avoid GPU->CPU copies)
+            int8_t x_cpu[HIDDEN_DIM];
+            memcpy(x_cpu, &model->embedding[inputs[t] * HIDDEN_DIM], HIDDEN_DIM);
+            
+            // Use GPU buffer as x for this timestep
+            void *gpu_x = gpu_embedding_buffer;
+            void *gpu_residual = gpu_work_buffers[0];
+            void *gpu_buf1 = gpu_work_buffers[1];
+            void *gpu_buf2 = gpu_work_buffers[2];
+            void *gpu_ft = gpu_work_buffers[3];
+            void *gpu_ht = gpu_work_buffers[4];
+            void *gpu_gated_past = gpu_work_buffers[5];
+            void *gpu_h_state[N_LAYERS];
+            for (int l = 0; l < N_LAYERS; l++) {
+                gpu_h_state[l] = gpu_work_buffers[6 + (l % 2)]; // Reuse buffers
+            }
+            
+            // Copy RNN state to GPU at start of timestep
+            for (int l = 0; l < N_LAYERS; l++) {
+                if (rnn_state) {
+                    egg_gpu_copy_to_buffer(gpu_h_state[l], rnn_state->h[l], HIDDEN_DIM);
+                } else {
+                    static int8_t zero[HIDDEN_DIM] = {0};
+                    egg_gpu_copy_to_buffer(gpu_h_state[l], zero, HIDDEN_DIM);
+                }
+            }
+            
+            // Layers - all on GPU
+            for(int l=0; l<N_LAYERS; l++) {
+                uint32_t l_seed = step_seed + (l * 100);
+                
+                // -- GRU --
+                // Copy x to residual (on GPU)
+                // For Shared buffers, we can just memcpy the contents
+                void *gpu_x_contents_residual = egg_gpu_get_buffer_contents(gpu_x);
+                void *gpu_residual_contents = egg_gpu_get_buffer_contents(gpu_residual);
+                if (gpu_x_contents_residual && gpu_residual_contents) {
+                    memcpy(gpu_residual_contents, gpu_x_contents_residual, HIDDEN_DIM);
+                }
+                
+                // Layer norm on GPU
+                egg_gpu_layer_norm(gpu_x, model->ln_weights[l][0], gpu_x, HIDDEN_DIM);
+                
+                // Update x_cpu after layer norm (for xB computation)
+                // Use Shared buffer contents directly (no sync needed)
+                void *gpu_x_contents_ln = egg_gpu_get_buffer_contents(gpu_x);
+                if (gpu_x_contents_ln) {
+                    memcpy(x_cpu, gpu_x_contents_ln, HIDDEN_DIM);
+                }
+                
+                // Matmuls using GPU buffers directly
+                int8_t noiseA1[HIDDEN_DIM], noiseB1[HIDDEN_DIM];
+                uint32_t rng1 = l_seed+1;
+                gen_noise_vector(&rng1, noiseA1, HIDDEN_DIM);
+                gen_noise_vector(&rng1, noiseB1, HIDDEN_DIM);
+                
+                // Reuse noise buffer
+                void *gpu_noiseB1 = gpu_noise_buffers[0];
+                egg_gpu_copy_to_buffer(gpu_noiseB1, noiseB1, HIDDEN_DIM);
+                // Compute xB on CPU (using updated x_cpu)
+                int32_t xB1 = dot_product_i8(x_cpu, noiseB1, HIDDEN_DIM);
+                // Use GPU matmul directly
+                egg_gpu_matmul_perturbed_gpu(gpu_x, model->gru_weights[l][0], gpu_buf1,
+                                             noiseA1, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, xB1);
+                
+                int8_t noiseA2[HIDDEN_DIM], noiseB2[HIDDEN_DIM];
+                uint32_t rng2 = l_seed+2;
+                gen_noise_vector(&rng2, noiseA2, HIDDEN_DIM);
+                gen_noise_vector(&rng2, noiseB2, HIDDEN_DIM);
+                
+                // Reuse noise buffer
+                void *gpu_noiseB2 = gpu_noise_buffers[1];
+                egg_gpu_copy_to_buffer(gpu_noiseB2, noiseB2, HIDDEN_DIM);
+                int32_t xB2 = 0;
+                if (!egg_gpu_dot_product(gpu_h_state[l], gpu_noiseB2, &xB2, HIDDEN_DIM)) {
+                    int8_t h_cpu[HIDDEN_DIM];
+                    egg_gpu_copy_from_buffer(h_cpu, gpu_h_state[l], HIDDEN_DIM);
+                    xB2 = dot_product_i8(h_cpu, noiseB2, HIDDEN_DIM);
+                }
+                egg_gpu_matmul_perturbed_gpu(gpu_h_state[l], model->gru_weights[l][1], gpu_buf2,
+                                             noiseA2, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, xB2);
+                
+                // Element-wise ops on GPU: buf1 + buf2 + bias -> ft
+                void *gpu_bias1 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_bias1) {
+                    egg_gpu_copy_to_buffer(gpu_bias1, model->gru_biases[l][0], HIDDEN_DIM);
+                    egg_gpu_clipped_add_three(gpu_buf1, gpu_buf2, gpu_bias1, gpu_ft, HIDDEN_DIM);
+                    egg_gpu_free_temp_buffer(gpu_bias1);
+                }
+                
+                // GRU gate on GPU: ft * h -> gated_past
+                egg_gpu_gru_gate(gpu_ft, gpu_h_state[l], gpu_gated_past, HIDDEN_DIM);
+                
+                // More matmuls...
+                int8_t noiseA3[HIDDEN_DIM], noiseB3[HIDDEN_DIM];
+                uint32_t rng3 = l_seed+3;
+                gen_noise_vector(&rng3, noiseA3, HIDDEN_DIM);
+                gen_noise_vector(&rng3, noiseB3, HIDDEN_DIM);
+                
+                // Reuse noise buffer
+                void *gpu_noiseB3 = gpu_noise_buffers[2];
+                egg_gpu_copy_to_buffer(gpu_noiseB3, noiseB3, HIDDEN_DIM);
+                // Update x_cpu from GPU (after residual add)
+                void *gpu_x_contents3 = egg_gpu_get_buffer_contents(gpu_x);
+                if (gpu_x_contents3) {
+                    memcpy(x_cpu, gpu_x_contents3, HIDDEN_DIM);
+                }
+                // Compute xB on CPU
+                int32_t xB3 = dot_product_i8(x_cpu, noiseB3, HIDDEN_DIM);
+                egg_gpu_matmul_perturbed_gpu(gpu_x, model->gru_weights[l][2], gpu_buf1,
+                                             noiseA3, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, xB3);
+                
+                int8_t noiseA4[HIDDEN_DIM], noiseB4[HIDDEN_DIM];
+                uint32_t rng4 = l_seed+4;
+                gen_noise_vector(&rng4, noiseA4, HIDDEN_DIM);
+                gen_noise_vector(&rng4, noiseB4, HIDDEN_DIM);
+                
+                // Reuse noise buffer
+                void *gpu_noiseB4 = gpu_noise_buffers[3];
+                egg_gpu_copy_to_buffer(gpu_noiseB4, noiseB4, HIDDEN_DIM);
+                int32_t xB4 = 0;
+                if (!egg_gpu_dot_product(gpu_gated_past, gpu_noiseB4, &xB4, HIDDEN_DIM)) {
+                    int8_t gated_cpu[HIDDEN_DIM];
+                    egg_gpu_copy_from_buffer(gated_cpu, gpu_gated_past, HIDDEN_DIM);
+                    xB4 = dot_product_i8(gated_cpu, noiseB4, HIDDEN_DIM);
+                }
+                egg_gpu_matmul_perturbed_gpu(gpu_gated_past, model->gru_weights[l][3], gpu_buf2,
+                                             noiseA4, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, xB4);
+                
+                // buf1 + buf2 + bias -> ht
+                void *gpu_bias2 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_bias2) {
+                    egg_gpu_copy_to_buffer(gpu_bias2, model->gru_biases[l][1], HIDDEN_DIM);
+                    egg_gpu_clipped_add_three(gpu_buf1, gpu_buf2, gpu_bias2, gpu_ht, HIDDEN_DIM);
+                    egg_gpu_free_temp_buffer(gpu_bias2);
+                }
+                
+                // State update on GPU
+                egg_gpu_gru_state_update(gpu_h_state[l], gpu_ft, gpu_ht, gpu_x, HIDDEN_DIM);
+                
+                // Residual add on GPU
+                egg_gpu_clipped_add(gpu_x, gpu_residual, gpu_x, HIDDEN_DIM);
+                
+                // MLP on GPU
+                {
+                    void *gpu_mlp_residual = gpu_residual; // Reuse buffer
+                    void *gpu_mlp_buf1 = gpu_buf1; // Reuse buffer
+                    
+                    // Copy residual
+                    void *gpu_x_contents2 = egg_gpu_get_buffer_contents(gpu_x);
+                    void *gpu_mlp_residual_contents = egg_gpu_get_buffer_contents(gpu_mlp_residual);
+                    if (gpu_x_contents2 && gpu_mlp_residual_contents) {
+                        memcpy(gpu_mlp_residual_contents, gpu_x_contents2, HIDDEN_DIM);
+                    }
+                    
+                    // Layer norm on GPU
+                    egg_gpu_layer_norm(gpu_x, model->ln_weights[l][1], gpu_x, HIDDEN_DIM);
+                    
+                    // Expand matmul - use pre-allocated large buffer
+                    int8_t noiseA5[HIDDEN_DIM * 4], noiseB5[HIDDEN_DIM];
+                    uint32_t rng5 = l_seed+5;
+                    gen_noise_vector(&rng5, noiseA5, HIDDEN_DIM * 4);
+                    gen_noise_vector(&rng5, noiseB5, HIDDEN_DIM);
+                    
+                    // Reuse noise buffer
+                    void *gpu_noiseB5 = gpu_noise_buffers[0];
+                    egg_gpu_copy_to_buffer(gpu_noiseB5, noiseB5, HIDDEN_DIM);
+                    int32_t xB5 = 0;
+                    if (egg_gpu_dot_product(gpu_x, gpu_noiseB5, &xB5, HIDDEN_DIM)) {
+                        egg_gpu_matmul_perturbed_gpu(gpu_x, model->mlp_weights[l][0], gpu_mlp_large_buffer,
+                                                     noiseA5, HIDDEN_DIM * 4, HIDDEN_DIM, 8, noise_sign, xB5);
+                    }
+                    
+                    // Project matmul
+                    int8_t noiseA6[HIDDEN_DIM], noiseB6[HIDDEN_DIM * 4];
+                    uint32_t rng6 = l_seed+6;
+                    gen_noise_vector(&rng6, noiseA6, HIDDEN_DIM);
+                    gen_noise_vector(&rng6, noiseB6, HIDDEN_DIM * 4);
+                    
+                    // For noiseB6, we need HIDDEN_DIM * 4, so allocate temporarily
+                    // (could pre-allocate but this is less common)
+                    // For noiseB6, compute on CPU (large buffer, less common)
+                    int8_t buf1_mlp_cpu[HIDDEN_DIM * 4];
+                    egg_gpu_copy_from_buffer(buf1_mlp_cpu, gpu_mlp_large_buffer, HIDDEN_DIM * 4);
+                    int32_t xB6 = dot_product_i8(buf1_mlp_cpu, noiseB6, HIDDEN_DIM * 4);
+                    egg_gpu_matmul_perturbed_gpu(gpu_mlp_large_buffer, model->mlp_weights[l][1], gpu_x,
+                                                 noiseA6, HIDDEN_DIM, HIDDEN_DIM * 4, 9, noise_sign, xB6);
+                    
+                    // Residual add on GPU
+                    egg_gpu_clipped_add(gpu_x, gpu_mlp_residual, gpu_x, HIDDEN_DIM);
+                }
+            }
+            
+            // Final Head - on GPU
+            static void *gpu_logits_buffer = NULL;
+            if (!gpu_logits_buffer) {
+                gpu_logits_buffer = egg_gpu_alloc_temp_buffer(VOCAB_SIZE);
+            }
+            
+            if (gpu_logits_buffer) {
+                // Layer norm on GPU
+                egg_gpu_layer_norm(gpu_x, model->ln_out, gpu_x, HIDDEN_DIM);
+                
+                // Head matmul
+                int8_t noiseA_head[VOCAB_SIZE], noiseB_head[HIDDEN_DIM];
+                uint32_t rng_head = step_seed+999;
+                gen_noise_vector(&rng_head, noiseA_head, VOCAB_SIZE);
+                gen_noise_vector(&rng_head, noiseB_head, HIDDEN_DIM);
+                
+                // Reuse noise buffer
+                void *gpu_noiseB_head = gpu_noise_buffers[0];
+                egg_gpu_copy_to_buffer(gpu_noiseB_head, noiseB_head, HIDDEN_DIM);
+                // Update x_cpu after final layer norm
+                void *gpu_x_head_contents = egg_gpu_get_buffer_contents(gpu_x);
+                if (gpu_x_head_contents) {
+                    memcpy(x_cpu, gpu_x_head_contents, HIDDEN_DIM);
+                }
+                int32_t xB_head = dot_product_i8(x_cpu, noiseB_head, HIDDEN_DIM);
+                egg_gpu_matmul_perturbed_gpu(gpu_x, model->head, gpu_logits_buffer,
+                                             noiseA_head, VOCAB_SIZE, HIDDEN_DIM, 8, noise_sign, xB_head);
+                
+                // Register logits for read-back after batch_end (Shared buffer, no sync needed)
+                // We'll read it in batch_end completion handler
+                // For now, just mark it - actual read happens in batch_end
+                // Actually, since it's Shared, we can read immediately
+                void *gpu_logits_contents = egg_gpu_get_buffer_contents(gpu_logits_buffer);
+                if (gpu_logits_contents) {
+                    memcpy(logits_out, gpu_logits_contents, VOCAB_SIZE);
+                }
+            }
+            
+            // Copy RNN state back from GPU
+            if (rnn_state) {
+                for (int l = 0; l < N_LAYERS; l++) {
+                    egg_gpu_copy_from_buffer(rnn_state->h[l], gpu_h_state[l], HIDDEN_DIM);
+                }
+            }
+            
+            // Copy final x back to CPU for loss computation
+            egg_gpu_copy_from_buffer(x, gpu_x, HIDDEN_DIM);
+            
+            if(targets && accumulated_loss) {
+                *accumulated_loss += compute_loss(logits_out, targets[t]);
+            }
+            
+            // Skip CPU path - continue to next timestep
+            continue;
+        }
+        // If GPU buffers failed to allocate, fall through to CPU path
+#endif
+        
+        // CPU path (fallback or when GPU not available)
         memcpy(x, &model->embedding[inputs[t] * HIDDEN_DIM], HIDDEN_DIM);
 
         // Layers
@@ -348,6 +693,173 @@ void forward_pass(
 
             // -- GRU --
             memcpy(residual, x, HIDDEN_DIM);
+#if defined(EGG_USE_METAL)
+            // Use GPU for layer norm
+            void *gpu_x = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            void *gpu_residual = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            void *gpu_buf1 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            void *gpu_buf2 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            void *gpu_ft = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            void *gpu_ht = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            void *gpu_gated_past = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            void *gpu_h = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+            
+            if (gpu_x && gpu_residual && gpu_buf1 && gpu_buf2 && gpu_ft && gpu_ht && gpu_gated_past && gpu_h) {
+                // Copy inputs to GPU
+                egg_gpu_copy_to_buffer(gpu_x, x, HIDDEN_DIM);
+                egg_gpu_copy_to_buffer(gpu_residual, residual, HIDDEN_DIM);
+                egg_gpu_copy_to_buffer(gpu_h, rnn_state->h[l], HIDDEN_DIM);
+                
+                // Layer norm on GPU
+                egg_gpu_layer_norm(gpu_x, model->ln_weights[l][0], gpu_x, HIDDEN_DIM);
+                
+                // Matmuls (output to GPU buffers)
+                int8_t noiseA1[HIDDEN_DIM], noiseB1[HIDDEN_DIM];
+                uint32_t rng1 = l_seed+1;
+                gen_noise_vector(&rng1, noiseA1, HIDDEN_DIM);
+                gen_noise_vector(&rng1, noiseB1, HIDDEN_DIM);
+                
+                // Upload noiseB to GPU and compute xB on GPU
+                void *gpu_noiseB1 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_noiseB1) {
+                    egg_gpu_copy_to_buffer(gpu_noiseB1, noiseB1, HIDDEN_DIM);
+                    int32_t xB1 = 0;
+                    if (egg_gpu_dot_product(gpu_x, gpu_noiseB1, &xB1, HIDDEN_DIM)) {
+                        int8_t *buf1_ptr = (int8_t*)egg_gpu_get_buffer_contents(gpu_buf1);
+                        if (buf1_ptr) {
+                            // Copy x to CPU for matmul (matmul still needs CPU input for now)
+                            int8_t x_cpu[HIDDEN_DIM];
+                            egg_gpu_copy_from_buffer(x_cpu, gpu_x, HIDDEN_DIM);
+                            egg_gpu_matmul_perturbed(x_cpu, model->gru_weights[l][0], buf1_ptr,
+                                                     noiseA1, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, xB1);
+                        }
+                    }
+                    egg_gpu_free_temp_buffer(gpu_noiseB1);
+                }
+                
+                int8_t noiseA2[HIDDEN_DIM], noiseB2[HIDDEN_DIM];
+                uint32_t rng2 = l_seed+2;
+                gen_noise_vector(&rng2, noiseA2, HIDDEN_DIM);
+                gen_noise_vector(&rng2, noiseB2, HIDDEN_DIM);
+                
+                // Upload noiseB2 to GPU and compute xB2 on GPU
+                void *gpu_noiseB2 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_noiseB2) {
+                    egg_gpu_copy_to_buffer(gpu_noiseB2, noiseB2, HIDDEN_DIM);
+                    int32_t xB2 = 0;
+                    if (egg_gpu_dot_product(gpu_h, gpu_noiseB2, &xB2, HIDDEN_DIM)) {
+                        int8_t *buf2_ptr = (int8_t*)egg_gpu_get_buffer_contents(gpu_buf2);
+                        if (buf2_ptr) {
+                            // Copy h to CPU for matmul
+                            int8_t h_cpu[HIDDEN_DIM];
+                            egg_gpu_copy_from_buffer(h_cpu, gpu_h, HIDDEN_DIM);
+                            egg_gpu_matmul_perturbed(h_cpu, model->gru_weights[l][1], buf2_ptr,
+                                                     noiseA2, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, xB2);
+                        }
+                    }
+                    egg_gpu_free_temp_buffer(gpu_noiseB2);
+                }
+                
+                // Element-wise ops on GPU: buf1 + buf2 + bias -> ft
+                void *gpu_bias1 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_bias1) {
+                    egg_gpu_copy_to_buffer(gpu_bias1, model->gru_biases[l][0], HIDDEN_DIM);
+                    egg_gpu_clipped_add_three(gpu_buf1, gpu_buf2, gpu_bias1, gpu_ft, HIDDEN_DIM);
+                    egg_gpu_free_temp_buffer(gpu_bias1);
+                }
+                
+                // GRU gate on GPU: ft * h -> gated_past
+                egg_gpu_gru_gate(gpu_ft, gpu_h, gpu_gated_past, HIDDEN_DIM);
+                
+                // More matmuls...
+                int8_t noiseA3[HIDDEN_DIM], noiseB3[HIDDEN_DIM];
+                uint32_t rng3 = l_seed+3;
+                gen_noise_vector(&rng3, noiseA3, HIDDEN_DIM);
+                gen_noise_vector(&rng3, noiseB3, HIDDEN_DIM);
+                
+                // Compute xB3 on GPU
+                void *gpu_noiseB3 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_noiseB3) {
+                    egg_gpu_copy_to_buffer(gpu_noiseB3, noiseB3, HIDDEN_DIM);
+                    int32_t xB3 = 0;
+                    if (egg_gpu_dot_product(gpu_x, gpu_noiseB3, &xB3, HIDDEN_DIM)) {
+                        int8_t *buf1_ptr2 = (int8_t*)egg_gpu_get_buffer_contents(gpu_buf1);
+                        if (buf1_ptr2) {
+                            int8_t x_cpu2[HIDDEN_DIM];
+                            egg_gpu_copy_from_buffer(x_cpu2, gpu_x, HIDDEN_DIM);
+                            egg_gpu_matmul_perturbed(x_cpu2, model->gru_weights[l][2], buf1_ptr2,
+                                                     noiseA3, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, xB3);
+                        }
+                    }
+                    egg_gpu_free_temp_buffer(gpu_noiseB3);
+                }
+                
+                int8_t noiseA4[HIDDEN_DIM], noiseB4[HIDDEN_DIM];
+                uint32_t rng4 = l_seed+4;
+                gen_noise_vector(&rng4, noiseA4, HIDDEN_DIM);
+                gen_noise_vector(&rng4, noiseB4, HIDDEN_DIM);
+                
+                // Compute xB4 on GPU
+                void *gpu_noiseB4 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_noiseB4) {
+                    egg_gpu_copy_to_buffer(gpu_noiseB4, noiseB4, HIDDEN_DIM);
+                    int32_t xB4 = 0;
+                    if (egg_gpu_dot_product(gpu_gated_past, gpu_noiseB4, &xB4, HIDDEN_DIM)) {
+                        int8_t *buf2_ptr2 = (int8_t*)egg_gpu_get_buffer_contents(gpu_buf2);
+                        if (buf2_ptr2) {
+                            int8_t gated_cpu[HIDDEN_DIM];
+                            egg_gpu_copy_from_buffer(gated_cpu, gpu_gated_past, HIDDEN_DIM);
+                            egg_gpu_matmul_perturbed(gated_cpu, model->gru_weights[l][3], buf2_ptr2,
+                                                     noiseA4, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, xB4);
+                        }
+                    }
+                    egg_gpu_free_temp_buffer(gpu_noiseB4);
+                }
+                
+                // buf1 + buf2 + bias -> ht
+                void *gpu_bias2 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_bias2) {
+                    egg_gpu_copy_to_buffer(gpu_bias2, model->gru_biases[l][1], HIDDEN_DIM);
+                    egg_gpu_clipped_add_three(gpu_buf1, gpu_buf2, gpu_bias2, gpu_ht, HIDDEN_DIM);
+                    egg_gpu_free_temp_buffer(gpu_bias2);
+                }
+                
+                // State update on GPU
+                egg_gpu_gru_state_update(gpu_h, gpu_ft, gpu_ht, gpu_x, HIDDEN_DIM);
+                
+                // Residual add on GPU
+                egg_gpu_clipped_add(gpu_x, gpu_residual, gpu_x, HIDDEN_DIM);
+                
+                // Copy final x back to CPU
+                egg_gpu_copy_from_buffer(x, gpu_x, HIDDEN_DIM);
+                egg_gpu_copy_from_buffer(rnn_state->h[l], gpu_h, HIDDEN_DIM);
+                
+                // Cleanup
+                egg_gpu_free_temp_buffer(gpu_x);
+                egg_gpu_free_temp_buffer(gpu_residual);
+                egg_gpu_free_temp_buffer(gpu_buf1);
+                egg_gpu_free_temp_buffer(gpu_buf2);
+                egg_gpu_free_temp_buffer(gpu_ft);
+                egg_gpu_free_temp_buffer(gpu_ht);
+                egg_gpu_free_temp_buffer(gpu_gated_past);
+                egg_gpu_free_temp_buffer(gpu_h);
+                
+                // Skip CPU path
+                goto skip_cpu_gru;
+            }
+            
+            // Fallback: free any allocated buffers
+            if (gpu_x) egg_gpu_free_temp_buffer(gpu_x);
+            if (gpu_residual) egg_gpu_free_temp_buffer(gpu_residual);
+            if (gpu_buf1) egg_gpu_free_temp_buffer(gpu_buf1);
+            if (gpu_buf2) egg_gpu_free_temp_buffer(gpu_buf2);
+            if (gpu_ft) egg_gpu_free_temp_buffer(gpu_ft);
+            if (gpu_ht) egg_gpu_free_temp_buffer(gpu_ht);
+            if (gpu_gated_past) egg_gpu_free_temp_buffer(gpu_gated_past);
+            if (gpu_h) egg_gpu_free_temp_buffer(gpu_h);
+#endif
+            
+            // CPU path (fallback)
             egg_ln(x, model->ln_weights[l][0], x);
 
             matmul_perturbed(x, model->gru_weights[l][0], buf1, HIDDEN_DIM, HIDDEN_DIM, l_seed+1, noise_sign, 8);
@@ -374,8 +886,99 @@ void forward_pass(
             
             // Residual Add
             for(int i=0; i<HIDDEN_DIM; i++) x[i] = clipped_add(x[i], residual[i]);
+            
+#if defined(EGG_USE_METAL)
+skip_cpu_gru:
+#endif
 
             // -- MLP --
+#if defined(EGG_USE_METAL)
+            // GPU path for MLP
+            {
+                void *gpu_mlp_residual = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                void *gpu_mlp_buf1 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM * 4);
+                
+                if (gpu_mlp_residual && gpu_mlp_buf1) {
+                // Copy residual
+                egg_gpu_copy_to_buffer(gpu_mlp_residual, x, HIDDEN_DIM);
+                
+                // Layer norm on GPU
+                egg_gpu_layer_norm(gpu_x, model->ln_weights[l][1], gpu_x, HIDDEN_DIM);
+                
+                // Expand matmul: Hidden -> 4*Hidden
+                int8_t noiseA5[HIDDEN_DIM * 4], noiseB5[HIDDEN_DIM];
+                uint32_t rng5 = l_seed+5;
+                gen_noise_vector(&rng5, noiseA5, HIDDEN_DIM * 4);
+                gen_noise_vector(&rng5, noiseB5, HIDDEN_DIM);
+                
+                void *gpu_noiseB5 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
+                if (gpu_noiseB5) {
+                    egg_gpu_copy_to_buffer(gpu_noiseB5, noiseB5, HIDDEN_DIM);
+                    int32_t xB5 = 0;
+                    if (egg_gpu_dot_product(gpu_x, gpu_noiseB5, &xB5, HIDDEN_DIM)) {
+                        int8_t *mlp_buf1_ptr = (int8_t*)egg_gpu_get_buffer_contents(gpu_mlp_buf1);
+                        if (mlp_buf1_ptr) {
+                            int8_t x_mlp_cpu[HIDDEN_DIM];
+                            egg_gpu_copy_from_buffer(x_mlp_cpu, gpu_x, HIDDEN_DIM);
+                            egg_gpu_matmul_perturbed(x_mlp_cpu, model->mlp_weights[l][0], mlp_buf1_ptr,
+                                                     noiseA5, HIDDEN_DIM * 4, HIDDEN_DIM, 8, noise_sign, xB5);
+                        }
+                    }
+                    egg_gpu_free_temp_buffer(gpu_noiseB5);
+                }
+                
+                // Project matmul: 4*Hidden -> Hidden
+                int8_t noiseA6[HIDDEN_DIM], noiseB6[HIDDEN_DIM * 4];
+                uint32_t rng6 = l_seed+6;
+                gen_noise_vector(&rng6, noiseA6, HIDDEN_DIM);
+                gen_noise_vector(&rng6, noiseB6, HIDDEN_DIM * 4);
+                
+                void *gpu_noiseB6 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM * 4);
+                if (gpu_noiseB6) {
+                    egg_gpu_copy_to_buffer(gpu_noiseB6, noiseB6, HIDDEN_DIM * 4);
+                    int32_t xB6 = 0;
+                    if (egg_gpu_dot_product(gpu_mlp_buf1, gpu_noiseB6, &xB6, HIDDEN_DIM * 4)) {
+                        int8_t *x_final_ptr = (int8_t*)egg_gpu_get_buffer_contents(gpu_x);
+                        if (x_final_ptr) {
+                            int8_t buf1_mlp_cpu[HIDDEN_DIM * 4];
+                            egg_gpu_copy_from_buffer(buf1_mlp_cpu, gpu_mlp_buf1, HIDDEN_DIM * 4);
+                            egg_gpu_matmul_perturbed(buf1_mlp_cpu, model->mlp_weights[l][1], x_final_ptr,
+                                                     noiseA6, HIDDEN_DIM, HIDDEN_DIM * 4, 9, noise_sign, xB6);
+                        }
+                    }
+                    egg_gpu_free_temp_buffer(gpu_noiseB6);
+                }
+                
+                // Residual add on GPU
+                egg_gpu_clipped_add(gpu_x, gpu_mlp_residual, gpu_x, HIDDEN_DIM);
+                
+                // Copy final x back to CPU
+                egg_gpu_copy_from_buffer(x, gpu_x, HIDDEN_DIM);
+                
+                    egg_gpu_free_temp_buffer(gpu_mlp_residual);
+                    egg_gpu_free_temp_buffer(gpu_mlp_buf1);
+                } else {
+                    // Fallback: free buffers
+                    if (gpu_mlp_residual) egg_gpu_free_temp_buffer(gpu_mlp_residual);
+                    if (gpu_mlp_buf1) egg_gpu_free_temp_buffer(gpu_mlp_buf1);
+                    
+                    // CPU path (fallback)
+                    memcpy(residual, x, HIDDEN_DIM);
+                    egg_ln(x, model->ln_weights[l][1], x);
+                    
+                    // Expand: Hidden -> 4*Hidden
+                    // Cols = HIDDEN_DIM (256). Sqrt(256)=16. Shift = 4+4=8.
+                    matmul_perturbed(x, model->mlp_weights[l][0], buf1, HIDDEN_DIM * 4, HIDDEN_DIM, l_seed+5, noise_sign, 8);
+                    
+                    // Project: 4*Hidden -> Hidden
+                    // Cols = HIDDEN_DIM*4 (1024). Sqrt(1024)=32. Shift = 4+5=9.
+                    matmul_perturbed(buf1, model->mlp_weights[l][1], x, HIDDEN_DIM, HIDDEN_DIM * 4, l_seed+6, noise_sign, 9);
+
+                    for(int i=0; i<HIDDEN_DIM; i++) x[i] = clipped_add(x[i], residual[i]);
+                }
+            }
+#else
+            // CPU path
             memcpy(residual, x, HIDDEN_DIM);
             egg_ln(x, model->ln_weights[l][1], x);
             
@@ -388,6 +991,7 @@ void forward_pass(
             matmul_perturbed(buf1, model->mlp_weights[l][1], x, HIDDEN_DIM, HIDDEN_DIM * 4, l_seed+6, noise_sign, 9);
 
             for(int i=0; i<HIDDEN_DIM; i++) x[i] = clipped_add(x[i], residual[i]);
+#endif
         }
 
         // Final Head
@@ -398,6 +1002,13 @@ void forward_pass(
             *accumulated_loss += compute_loss(logits_out, targets[t]);
         }
     }
+
+#if defined(EGG_USE_METAL)
+    // End batching: commit all GPU operations and wait for results
+    if (!gpu_disabled) {
+        egg_gpu_batch_end();
+    }
+#endif
 }
 
 static inline void evaluate_population_pair(
@@ -604,9 +1215,9 @@ void sample_model(EggModel *model, const uint8_t *seed_text, int seed_len, int g
     printf(COLOR_RESET "\n");
 }
 
-Dataset load_data(const char *filename) {
+Dataset load_data(const char *filename, char *resolved_path_out, size_t resolved_size) {
     bool is_pipe = false;
-    FILE *f = open_dataset_stream(filename, &is_pipe);
+    FILE *f = open_dataset_stream(filename, &is_pipe, resolved_path_out, resolved_size);
     if (!f) {
         fprintf(stderr, "Error: failed to open dataset '%s'.\n", filename);
         exit(1);
@@ -654,9 +1265,17 @@ Dataset load_data(const char *filename) {
 int main() {
     srand(time(NULL));
     init_tables();
-    Dataset ds = load_data("input.txt");
-    printf("Loaded dataset: %ld bytes\n", ds.length);
 
+    // Prefer compressed input if it exists
+    const char *dataset_path = "input.txt";
+    if (access("input.txt.zst", F_OK) == 0) {
+        dataset_path = "input.txt.zst";
+    }
+    char resolved_path[PATH_MAX];
+    Dataset ds = load_data(dataset_path, resolved_path, sizeof(resolved_path));
+    printf("Loaded dataset: %ld bytes from %s\n", ds.length, resolved_path);
+    fflush(stdout);
+    
     EggModel *model = NULL;
     int pm_status = posix_memalign((void**)&model, 16, sizeof(EggModel));
     if (pm_status != 0 || !model) {
@@ -728,7 +1347,14 @@ int main() {
     memset(pop_states, 0, POPULATION_SIZE * sizeof(RecurrentState));
     memset(&main_state, 0, sizeof(RecurrentState));
 
-    printf("Starting EGGROLL Training (Stateful + Optimized)...\n");
+    time_t now = time(NULL);
+    char time_buf[32] = "unknown";
+    struct tm *tm_now = localtime(&now);
+    if (tm_now) {
+        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_now);
+    }
+    printf("Starting EGGROLL Training (Stateful + Optimized) at datetime %s\n", time_buf);
+    fflush(stdout);
     
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -751,8 +1377,22 @@ int main() {
             double elapsed_sec = (current_time.tv_sec - start_time.tv_sec) + 
                                  (current_time.tv_nsec - start_time.tv_nsec) / 1e9;
             double tps = (elapsed_sec > 0) ? (double)total_tokens / elapsed_sec : 0.0;
+
+            /* Format current wall-clock time */
+            time_t now = time(NULL);
+            char time_buf[32] = "unknown";
+            struct tm *tm_now = localtime(&now);
+            if (tm_now) {
+                strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_now);
+            }
+
             // Loss is accumulated fixed point. Divide by SEQ_LEN to get average per token, then by 2^FIXED_POINT
-            printf("Step %ld/%ld | Loss: %.4f | Tok/s: %.2f\n", step, max_steps, (double)loss_val / (SEQ_LEN * (1 << FIXED_POINT)), tps);
+            printf("Step %ld/%ld | Loss: %.4f | Tok/s: %.2f at datetime %s\n",
+                   step, max_steps,
+                   (double)loss_val / (SEQ_LEN * (1 << FIXED_POINT)),
+                   tps,
+                   time_buf);
+            fflush(stdout);
         }
 
 #if defined(__APPLE__)

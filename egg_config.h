@@ -5,8 +5,10 @@
 #define VOCAB_SIZE 256        // Byte-level tokenization
 #define HIDDEN_DIM 512        // Model width
 #define N_LAYERS 4            // Number of layers
-#define SEQ_LEN 4096          // Sequence length for BPTT (truncated)
-#define POPULATION_SIZE 128   // Number of perturbations per step
+//#define SEQ_LEN 4096          // Sequence length for BPTT (truncated)
+#define SEQ_LEN 256          // Sequence length for BPTT (truncated)
+//#define POPULATION_SIZE 128   // Number of perturbations per step
+#define POPULATION_SIZE 32   // Number of perturbations per step
 #define BATCH_SIZE 8          // Parallel streams
 #define FIXED_POINT 4         // 4 bits for fractional part
 #define SIGMA_SHIFT 4         // Noise scale (bitwise shift)

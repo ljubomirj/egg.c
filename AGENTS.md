@@ -33,7 +33,8 @@ I myself Ljubomir - LJ, I'm writing into README.LJ. Do not write into README.LJ 
 
 ### Conventions, rules of thumb.
 
-The inspirational book for this was "Writing Solid Code" by Steve Maguire.
+Agent - read through and summarised the book "Writing Solid Code" by Steve Maguire. It changed how I think of coding on lower, as well as higher levels.
+Solid code is most often boring code. Write boring code. Write code with intention to be read and understood by other people 1st.
 
 Break them for a reason & within reason, otherwise stick to them. When weighting alternatives consider code reading the highest priority. 
 Make it easy to reason at the point of use, save the reader the effort of jumping to the definition.
