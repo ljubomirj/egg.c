@@ -56,8 +56,25 @@ void handle_sigint(int sig) {
 // This makes exp(-i/23.08) ≈ 2^(-i/16), matching the legacy curve shape
 #define SOFTMAX_EXP_SCALE 23.08
 
+// RoPE Configuration
+#define ROPE_SCALE_BIT 16
+#define ROPE_SCALE (1 << ROPE_SCALE_BIT)
+#define ROPE_LUT_SIZE (SEQ_LEN * (HEAD_DIM / 2) * 2)
+// Softmax Configuration - Extended to 256 entries to match legacy range
+#define SOFTMAX_SCALE_BIT 20
+#define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)  // 1,048,576
+#define SOFTMAX_LUT_SIZE 256
+// Scaling factor: legacy used 2^(i/16), we use exp(-i/K) where K = 16/ln(2) ≈ 23.08
+// This makes exp(-i/23.08) ≈ 2^(-i/16), matching the legacy curve shape
+#define SOFTMAX_EXP_SCALE 23.08
+
+// RoPE Configuration
+#define ROPE_SCALE_BIT 16
+#define ROPE_SCALE (1 << ROPE_SCALE_BIT)
+#define ROPE_LUT_SIZE (SEQ_LEN * (HEAD_DIM / 2) * 2)
+
 #define SEED_OFF_EMB 0
-#define SEED_OFF_POS 1
+// SEED_OFF_POS removed (RoPE)
 #define SEED_OFF_EMB_BIAS 50
 #define SEED_OFF_LN_1 100
 #define SEED_OFF_Q_A 200
@@ -110,7 +127,7 @@ typedef struct { uint8_t *data; long length; } Dataset;
 typedef struct {
     WeightType embedding[VOCAB_SIZE * HIDDEN_DIM];
     WeightType emb_bias[HIDDEN_DIM];
-    WeightType pos_emb[SEQ_LEN * HIDDEN_DIM];
+    // RoPE: pos_emb removed
     WeightType ln_1[N_LAYERS][HIDDEN_DIM];
     WeightType ln_1_bias[N_LAYERS][HIDDEN_DIM];
     WeightType w_q[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
@@ -137,7 +154,7 @@ typedef struct {
 typedef struct {
     AdamParam embedding[VOCAB_SIZE * HIDDEN_DIM];
     AdamParam emb_bias[HIDDEN_DIM];
-    AdamParam pos_emb[SEQ_LEN * HIDDEN_DIM];
+    // RoPE: pos_emb removed
     AdamParam ln_1[N_LAYERS][HIDDEN_DIM];
     AdamParam ln_1_bias[N_LAYERS][HIDDEN_DIM];
     AdamParam w_q[N_LAYERS][HIDDEN_DIM * HIDDEN_DIM];
@@ -167,6 +184,10 @@ int32_t h_EXP_LUT[SOFTMAX_LUT_SIZE];
 // Activation LUT (GELU)
 __constant__ int8_t d_ACT_LUT[256];
 int8_t h_ACT_LUT[256];
+
+// RoPE Look-Up Table: [SEQ_LEN][HEAD_DIM/2][2 (cos, sin)]
+__constant__ int32_t d_ROPE_LUT[ROPE_LUT_SIZE];
+int32_t h_ROPE_LUT[ROPE_LUT_SIZE];
 
 __device__ int32_t d_debug_updates[2];
 __device__ unsigned long long d_total_updates;
@@ -198,6 +219,26 @@ void init_tables() {
         int val = (int)round(y * (1 << FIXED_POINT));
         h_ACT_LUT[i] = (int8_t)((val > 127) ? 127 : ((val < -127) ? -127 : val));
     }
+
+    // Initialize RoPE LUT
+    // [SEQ_LEN][HEAD_DIM/2][2] (cos, sin)
+    // theta_i = 10000^(-2i/d)
+    for (int t = 0; t < SEQ_LEN; t++) {
+        for (int i = 0; i < HEAD_DIM / 2; i++) {
+            double theta = pow(10000.0, -2.0 * i / HEAD_DIM);
+            double alpha = t * theta;
+            double c = cos(alpha);
+            double s = sin(alpha);
+            
+            // Scale by ROPE_SCALE (2^16)
+            int32_t c_int = (int32_t)round(c * ROPE_SCALE);
+            int32_t s_int = (int32_t)round(s * ROPE_SCALE);
+            
+            int base_idx = t * (HEAD_DIM) + i * 2;
+            h_ROPE_LUT[base_idx] = c_int;
+            h_ROPE_LUT[base_idx + 1] = s_int;
+        }
+    }
 }
 
 static inline uint32_t xorshift32_host(uint32_t *state) {
@@ -214,7 +255,7 @@ void init_model(TransformerModel *model) {
     for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) temp->embedding[i] = gen_noise_host(&rng);
     transpose_matrix(model->embedding, temp->embedding, VOCAB_SIZE, HIDDEN_DIM);
     for(int i=0; i<HIDDEN_DIM; i++) model->emb_bias[i] = 0;
-    for(int i=0; i<SEQ_LEN*HIDDEN_DIM; i++) model->pos_emb[i] = gen_noise_host(&rng);
+    // RoPE: Removed pos_emb initialization
     
     for(int l=0; l<N_LAYERS; l++) {
         for(int i=0; i<HIDDEN_DIM; i++) { 
@@ -267,6 +308,52 @@ __device__ __forceinline__ AccumType block_reduce_sum_broadcast(AccumType val, B
     return ret;
 }
 
+// Helper: Apply RoPE Rotary Position Embedding (Integer Arithmetic)
+// Input: val (AccumType/int32) is one component of the vector (Q or K) at thread 'tid'
+// t: sequence position
+// tid: embedding dimension index (0..HIDDEN_DIM-1)
+// Function exchanges values with neighbor and applies rotation.
+// Returns: Rotated value
+__device__ __forceinline__ AccumType apply_rope_integer(AccumType val, int t, int tid) {
+    // 1. Identify head dim index and pair index
+    int head_dim_idx = tid % HEAD_DIM;
+    int pair_idx = head_dim_idx / 2;
+    int is_odd = head_dim_idx % 2; // 0 for even (real part), 1 for odd (imag part)
+
+    // 2. Load cos/sin from LUT
+    // LUT Layout: [SEQ_LEN][HEAD_DIM/2][2]
+    // Index = t * HEAD_DIM + pair_idx * 2
+    int lut_idx = t * HEAD_DIM + pair_idx * 2;
+    int32_t c = d_ROPE_LUT[lut_idx];     // Cosine
+    int32_t s = d_ROPE_LUT[lut_idx + 1]; // Sine
+
+    // 3. Exchange value with neighbor (butterfly exchange)
+    // Lane 0 talks to 1, 2 to 3, etc. This is XOR 1.
+    // If even: my val is x, neighbor is y.
+    // If odd: my val is y, neighbor is x.
+    AccumType neighbor_val = __shfl_xor_sync(0xFFFFFFFF, val, 1);
+
+    // 4. Apply Rotation
+    // Formula:
+    // x' = x * cos - y * sin
+    // y' = x * sin + y * cos
+    // We use int64_t for intermediate product to avoid overflow, then shift back.
+    // Scale is ROPE_SCALE_BIT (16).
+    
+    int64_t res;
+    if (is_odd == 0) {
+        // I am X. Neighbor is Y.
+        // x' = x*c - y*s
+        res = ((int64_t)val * c - (int64_t)neighbor_val * s) >> ROPE_SCALE_BIT;
+    } else {
+        // I am Y. Neighbor is X.
+        // y' = x*s + y*c (neighbor is x)
+        res = ((int64_t)neighbor_val * s + (int64_t)val * c) >> ROPE_SCALE_BIT;
+    }
+
+    return (AccumType)res;
+}
+
 __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     const uint8_t * __restrict__ dataset, long data_len, int start_idx,
     const TransformerModel * __restrict__ model,
@@ -302,17 +389,12 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         WeightType ebias = model->emb_bias[tid];
         int8_t emb_bias_n = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_BIAS, tid);
         
-        WeightType pos = model->pos_emb[t * HIDDEN_DIM + tid];
+        // RoPE: Absolute pos emb removed
         int8_t a_tok = noise_from_hash(seed_emb, input_token);
         int8_t b_dim = noise_from_hash(seed_emb + HIDDEN_DIM, tid);
         AccumType perturb = ((AccumType)a_tok * b_dim * ns) >> (FIXED_POINT + SIGMA_SHIFT);
 
-        uint32_t seed_pos = (step_seed + pair_idx) + SEED_OFF_POS;
-        int8_t a_pos = noise_from_hash(seed_pos, t);
-        int8_t b_pos = noise_from_hash(seed_pos + SEQ_LEN, tid);
-        AccumType perturb_pos = ((AccumType)a_pos * b_pos * ns) >> (FIXED_POINT + SIGMA_SHIFT);
-
-        s_x[tid] = clip((AccumType)emb + ebias + (((AccumType)emb_bias_n * ns) >> SIGMA_SHIFT_VECTOR) + pos + perturb + perturb_pos);
+        s_x[tid] = clip((AccumType)emb + ebias + (((AccumType)emb_bias_n * ns) >> SIGMA_SHIFT_VECTOR) + perturb);
         __syncthreads();
 
         // 2. Stack
@@ -353,6 +435,11 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 ak += ((sbk * (AccumType)noise_from_hash(seed_base + SEED_OFF_K_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
                 av += ((sbv * (AccumType)noise_from_hash(seed_base + SEED_OFF_V_A, tid)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
             }
+
+            // Apply RoPE rotation to Q and K
+            aq = apply_rope_integer(aq, t, tid);
+            ak = apply_rope_integer(ak, t, tid);
+
             ActType qv = clip(aq>>SHIFT_PROJ), kv = clip(ak>>SHIFT_PROJ), vv = clip(av>>SHIFT_PROJ);
             
             // Store KV
@@ -755,9 +842,8 @@ __global__ void generate_sequence_kernel(
         // 1. Embedding
         WeightType emb = model->embedding[tid * VOCAB_SIZE + input_token];
         WeightType ebias = model->emb_bias[tid];
-        WeightType pos = model->pos_emb[(t % SEQ_LEN) * HIDDEN_DIM + tid]; 
         
-        s_x[tid] = clip((AccumType)emb + ebias + pos);
+        s_x[tid] = clip((AccumType)emb + ebias);
         __syncthreads();
 
         // 2. Layers
@@ -785,6 +871,11 @@ __global__ void generate_sequence_kernel(
                 ak += (AccumType)v * wk[k*HIDDEN_DIM + tid];
                 av += (AccumType)v * wv[k*HIDDEN_DIM + tid];
             }
+            
+            // Apply RoPE rotation to Q and K
+            aq = apply_rope_integer(aq, t, tid);
+            ak = apply_rope_integer(ak, t, tid);
+
             ActType qv = clip(aq>>SHIFT_PROJ), kv = clip(ak>>SHIFT_PROJ), vv = clip(av>>SHIFT_PROJ);
 
             // Store KV
@@ -1015,6 +1106,7 @@ int main() {
     cudaMemcpyToSymbol(d_EXP2_TABLE, h_EXP2_TABLE, 256*sizeof(int32_t));
     cudaMemcpyToSymbol(d_EXP_LUT, h_EXP_LUT, SOFTMAX_LUT_SIZE*sizeof(int32_t));
     cudaMemcpyToSymbol(d_ACT_LUT, h_ACT_LUT, 256*sizeof(int8_t));
+    cudaMemcpyToSymbol(d_ROPE_LUT, h_ROPE_LUT, ROPE_LUT_SIZE*sizeof(int32_t));
 
     printf("\n=== EGG TRANSFORMER ADAM ===\n");
     printf("AdamW Config: B1=%.3f B2=%.3f EPS=%.1e WD=%.4f (Dynamic LR)\n", 
@@ -1128,7 +1220,7 @@ int main() {
         
         update_vector_adam_kernel<<< (HIDDEN_DIM+255)/256, 256 >>>((WeightType*)d_model->emb_bias, (AdamParam*)d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS, 0, d_fit, seed, current_lr*0.1); 
         update_matrix_adam_kernel<<< (VOCAB_SIZE*HIDDEN_DIM+511)/512, 512 >>>((WeightType*)d_model->embedding, (AdamParam*)d_adam_state->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0, d_fit, seed, current_lr);
-        update_matrix_adam_kernel<<< (SEQ_LEN*HIDDEN_DIM+511)/512, 512 >>>((WeightType*)d_model->pos_emb, (AdamParam*)d_adam_state->pos_emb, SEQ_LEN, HIDDEN_DIM, SEED_OFF_POS+SEQ_LEN, SEED_OFF_POS, 0, d_fit, seed, current_lr);
+        // RoPE: Removed pos_emb update
 
         CHECK_CUDA(cudaDeviceSynchronize());
         clock_gettime(CLOCK_MONOTONIC, &t1);
