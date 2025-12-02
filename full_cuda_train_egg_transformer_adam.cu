@@ -38,7 +38,6 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-// Population Sizing (Target 20GB)
 #define POPULATION_BATCH_SIZE (8192 * 2)
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 1)
 
@@ -48,30 +47,16 @@ void handle_sigint(int sig) {
 #define MAX_VAL 127
 #define MIN_VAL -127
 
-// Softmax Configuration - Extended to 256 entries to match legacy range
 #define SOFTMAX_SCALE_BIT 20
-#define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)  // 1,048,576
+#define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)  
 #define SOFTMAX_LUT_SIZE 256
-// Scaling factor: legacy used 2^(i/16), we use exp(-i/K) where K = 16/ln(2) ≈ 23.08
-// This makes exp(-i/23.08) ≈ 2^(-i/16), matching the legacy curve shape
 #define SOFTMAX_EXP_SCALE 23.08
 
 // RoPE Configuration
 #define ROPE_SCALE_BIT 16
 #define ROPE_SCALE (1 << ROPE_SCALE_BIT)
 #define ROPE_LUT_SIZE (SEQ_LEN * (HEAD_DIM / 2) * 2)
-// Softmax Configuration - Extended to 256 entries to match legacy range
-#define SOFTMAX_SCALE_BIT 20
-#define SOFTMAX_SCALE (1 << SOFTMAX_SCALE_BIT)  // 1,048,576
-#define SOFTMAX_LUT_SIZE 256
-// Scaling factor: legacy used 2^(i/16), we use exp(-i/K) where K = 16/ln(2) ≈ 23.08
-// This makes exp(-i/23.08) ≈ 2^(-i/16), matching the legacy curve shape
-#define SOFTMAX_EXP_SCALE 23.08
 
-// RoPE Configuration
-#define ROPE_SCALE_BIT 16
-#define ROPE_SCALE (1 << ROPE_SCALE_BIT)
-#define ROPE_LUT_SIZE (SEQ_LEN * (HEAD_DIM / 2) * 2)
 
 #define SEED_OFF_EMB 0
 // SEED_OFF_POS removed (RoPE)
@@ -198,18 +183,13 @@ double get_time_diff_ms(struct timespec start, struct timespec end) {
 }
 
 void init_tables() {
-    // Legacy base-2 table
     for(int i=0; i<256; i++) h_EXP2_TABLE[i] = (int32_t)(pow(2.0, (double)i / (1 << FIXED_POINT)) * (1 << FIXED_POINT));
     
-    // New scaled exponential LUT: exp(-i/K) * 2^20 where K ≈ 23.08
-    // This makes exp(-i/23.08) ≈ 2^(-i/16), matching the legacy curve shape
     for(int i=0; i<SOFTMAX_LUT_SIZE; i++) {
         double val = exp(-(double)i / SOFTMAX_EXP_SCALE) * SOFTMAX_SCALE;
         h_EXP_LUT[i] = (val >= 1.0) ? (int32_t)round(val) : 0;
     }
 
-    // Initialize Activation LUT (GELU)
-    // Input i is raw int8 (-128 to 127) representing fixed point value
     for(int i=0; i<256; i++) {
         int8_t input = (int8_t)i;
         double x = (double)input / (1 << FIXED_POINT);
@@ -220,9 +200,6 @@ void init_tables() {
         h_ACT_LUT[i] = (int8_t)((val > 127) ? 127 : ((val < -127) ? -127 : val));
     }
 
-    // Initialize RoPE LUT
-    // [SEQ_LEN][HEAD_DIM/2][2] (cos, sin)
-    // theta_i = 10000^(-2i/d)
     for (int t = 0; t < SEQ_LEN; t++) {
         for (int i = 0; i < HEAD_DIM / 2; i++) {
             double theta = pow(10000.0, -2.0 * i / HEAD_DIM);
@@ -245,39 +222,10 @@ static inline uint32_t xorshift32_host(uint32_t *state) {
     uint32_t x = *state; x ^= x << 13; x ^= x >> 17; x ^= x << 5; *state = x; return x;
 }
 static inline int8_t gen_noise_host(uint32_t *rng) { return (int8_t)((xorshift32_host(rng) & 1 ? 1 : -1) * ((xorshift32_host(rng) >> 1) & 15)); }
-// Repack matrix for SIMD: Convert [In][Out] (linear transposed) to [In/4][Out][4]
-// Src assumed to be [Out][In] if row-major?
-// Original transpose_matrix produced [Out][In] layout (physically contiguous in In for fixed Out?? No)
-// Let's stick to: We want dst[idx] to correspond to Tiled Layout.
-// Layout: int32 array of size (Rows/4 * Cols).
-// Element at (chunk_k, tid) contains { W[k][tid], W[k+1][tid], W[k+2][tid], W[k+3][tid] }
-// where k = chunk_k * 4.
-// This allows a thread 'tid' to load 4 weights along K with one int32 load.
-// Note: Rows = Input Dim, Cols = Output Dim.
-void repack_matrix(int8_t *dst, int8_t *src, int rows, int cols) {
-    // Src is linear. Was populated by transpose_matrix as dst[c*rows + r] = src[r*cols + c]
-    // where r=Input, c=Output. 
-    // So Src physically stores: col 0 (all rows), col 1 (all rows)...
-    // So Src is [Out][In] layout.
-    // Index = out * rows + in.
-    
-    // We want Dst to be: Groups of 4 rows packed.
-    // Address = (in / 4) * cols + out. (Pack 4 bytes at this address)
-    // Byte 0: (in/4)*4, out. Byte 1: (in/4)*4+1, out.
-    // Wait. Linear index for Dst (int32): (in/4) * cols + out.
-    // This organizes memory as: Chunk 0 (all cols), Chunk 1 (all cols)...
-    // Inside Chunk 0: Col 0, Col 1... 
-    // Thread 'tid' (Col) reads Dst[Chunk][tid].
-    // Adjacent indices Dst[Chunk][tid] and Dst[Chunk][tid+1] are adjacent int32s?
-    // Yes. So coalesced load of int32s!
-    
+
+void repack_matrix(int8_t *dst, int8_t *src, int rows, int cols) {  
     int chunks = rows / 4;
     int32_t *d32 = (int32_t*)dst;
-    
-    // Validate alignment
-    // This reshuffle assumes src is compatible with what we expect.
-    // But init_model calls this instead of transpose. 
-    // So let's write from 'temp' (Row-Major: In * Cols + Out) to Packed.
     
     for(int k=0; k<rows; k+=4) {
         for(int tid=0; tid<cols; tid++) {
@@ -300,22 +248,8 @@ void init_model(TransformerModel *model) {
     TransformerModel *temp = (TransformerModel*)calloc(1, sizeof(TransformerModel));
     if(!temp) exit(1);
     
-    // Embedding: VOCAB * HIDDEN. In=HIDDEN, Out=VOCAB.
-    // Loop uses: ah += norm[k] * emb[k*VOCAB + tid]. 
-    // Rows=HIDDEN (k), Cols=VOCAB (tid).
     for(int i=0; i<VOCAB_SIZE*HIDDEN_DIM; i++) temp->embedding[i] = gen_noise_host(&rng);
-    // Note: temp generates VOCAB*HIDDEN. Usually used as [VOCAB][HIDDEN]?
-    // Original init: for(i...VOCAB*HIDDEN) temp... trans(dst, temp, VOCAB, HIDDEN)
-    // Transpose call was (VOCAB, HIDDEN). So rows=VOCAB, cols=HIDDEN.
-    // Result accessed as [k*VOCAB + tid].
-    // Wait. If transposed with rows=VOCAB, cols=HIDDEN.
-    // Dst has [Col][Row] -> [HIDDEN][VOCAB].
-    // So accessing [k*VOCAB + tid] means k is Col (HIDDEN), tid is Row (VOCAB)?
-    // Yes, k is HIDDEN, tid is VOCAB.
-    // So we invoke repack with In=HIDDEN, Out=VOCAB.
-    // And Src (temp) is... wait temp was linear.
-    // We can just use temp directly as input to repack but we need to match indices.
-    // Let's assume temp is just bag of noise.
+
     repack_matrix(model->embedding, (int8_t*)temp->embedding, HIDDEN_DIM, VOCAB_SIZE);
     
     for(int i=0; i<HIDDEN_DIM; i++) model->emb_bias[i] = 0;
@@ -345,25 +279,7 @@ void init_model(TransformerModel *model) {
 }
 
 void repack_parameters(AdamModel *adam_state) {
-    // Repack Adam state to match weight layout
-    // Adam Param is struct of 3 floats (12 bytes).
-    // We need to reorder them same as int8s.
-    // This is expensive (struct copies), but done once on load/init.
-    // Wait, init uses 0 so it's fine.
-    // Load uses previous state... we must convert.
-    // For now, if we load old Adam state with new code, it is INVALID.
-    // We will reset Adam state if we detect legacy layout? Hard to detect.
-    // User task is optimizing compute. 
-    // We will just zero out Adam state for simplicity on "repack" path or assume fresh.
-    // But let's at least try to match logic if we wanted to.
-    // Logic: linear index maps to (k, tid) differently.
-    // We will just leave Adam state as is and rely on the Kernel to map index correctly.
-    // Wait, update_matrix_adam takes pointer to Weight and Adam.
-    // It updates Weight[idx] and Adam[idx].
-    // If we permute Weight array, Weight[idx] changes meaning.
-    // So Adam[idx] MUST correspond to the new Weight[idx].
-    // So yes, Adam array must be permuted.
-    // Since we are changing the layout, let's assume we start fresh or accept garbage for first few steps.
+    
 }
 
 // --- DEVICE KERNELS & HELPERS ---
@@ -378,9 +294,6 @@ __device__ __forceinline__ int8_t noise_from_hash(uint32_t s, uint32_t idx) {
 }
 __device__ __forceinline__ int8_t clip(AccumType a) { return (a > MAX_VAL) ? MAX_VAL : ((a < MIN_VAL) ? MIN_VAL : (int8_t)a); }
 
-// Helper: Softmax exponential lookup - 256 entry version
-// Input: diff = score - max_score (should be <= 0)
-// Returns: exp(diff/K) * 2^20, clamped to [0, 255] index range
 __device__ __forceinline__ int32_t softmax_exp_lookup(int32_t diff) {
     int index = -diff;  // diff is negative or zero, so index is positive
     index = (index < 0) ? 0 : ((index > 255) ? 255 : index);
@@ -388,13 +301,7 @@ __device__ __forceinline__ int32_t softmax_exp_lookup(int32_t diff) {
 }
 
 __device__ __forceinline__ int simd_dp4a(int a, int b, int c) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 610)
     return __dp4a(a, b, c);
-#else
-    int8_t *va = (int8_t*)&a;
-    int8_t *vb = (int8_t*)&b;
-    return c + va[0]*vb[0] + va[1]*vb[1] + va[2]*vb[2] + va[3]*vb[3];
-#endif
 }
 
 // Helper: Sum reduction + Broadcast
@@ -407,46 +314,23 @@ __device__ __forceinline__ AccumType block_reduce_sum_broadcast(AccumType val, B
     return ret;
 }
 
-// Helper: Apply RoPE Rotary Position Embedding (Integer Arithmetic)
-// Input: val (AccumType/int32) is one component of the vector (Q or K) at thread 'tid'
-// t: sequence position
-// tid: embedding dimension index (0..HIDDEN_DIM-1)
-// Function exchanges values with neighbor and applies rotation.
-// Returns: Rotated value
+
 __device__ __forceinline__ AccumType apply_rope_integer(AccumType val, int t, int tid) {
-    // 1. Identify head dim index and pair index
+
     int head_dim_idx = tid % HEAD_DIM;
     int pair_idx = head_dim_idx / 2;
-    int is_odd = head_dim_idx % 2; // 0 for even (real part), 1 for odd (imag part)
+    int is_odd = head_dim_idx % 2; 
 
-    // 2. Load cos/sin from LUT
-    // LUT Layout: [SEQ_LEN][HEAD_DIM/2][2]
-    // Index = t * HEAD_DIM + pair_idx * 2
     int lut_idx = t * HEAD_DIM + pair_idx * 2;
     int32_t c = d_ROPE_LUT[lut_idx];     // Cosine
     int32_t s = d_ROPE_LUT[lut_idx + 1]; // Sine
 
-    // 3. Exchange value with neighbor (butterfly exchange)
-    // Lane 0 talks to 1, 2 to 3, etc. This is XOR 1.
-    // If even: my val is x, neighbor is y.
-    // If odd: my val is y, neighbor is x.
     AccumType neighbor_val = __shfl_xor_sync(0xFFFFFFFF, val, 1);
-
-    // 4. Apply Rotation
-    // Formula:
-    // x' = x * cos - y * sin
-    // y' = x * sin + y * cos
-    // We use int64_t for intermediate product to avoid overflow, then shift back.
-    // Scale is ROPE_SCALE_BIT (16).
     
     int64_t res;
     if (is_odd == 0) {
-        // I am X. Neighbor is Y.
-        // x' = x*c - y*s
         res = ((int64_t)val * c - (int64_t)neighbor_val * s) >> ROPE_SCALE_BIT;
     } else {
-        // I am Y. Neighbor is X.
-        // y' = x*s + y*c (neighbor is x)
         res = ((int64_t)neighbor_val * s + (int64_t)val * c) >> ROPE_SCALE_BIT;
     }
 
@@ -590,9 +474,6 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 __syncthreads();
             }
             
-            // Now s_head_max[h] contains the max score for each head
-            
-            // PASS 2: Compute exp(score - max) and weighted sum
             AttnAccumType w_v_sum = 0;
             uint64_t tot_sc = 0;
             int32_t my_head_max = s_head_max[h];
@@ -659,11 +540,6 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
             const int32_t *wup_p = (const int32_t*)model->w_up[l];
             int32_t *v_ptr_up = (int32_t*)s_norm;
-            // Need to compute 4x output dims. Loop.
-            // wup has 4*HIDDEN cols.
-            // Layout repacked: In/4 x Out. Out stride 1.
-            // Total Out = 4*HIDDEN.
-            // Index: k_chunk * (4*HIDDEN) + oidx.
             
             for(int sub=0; sub<4; sub++) {
                 int oidx = tid + sub*HIDDEN_DIM;
@@ -673,7 +549,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 }
                 if(ns!=0) aup += ((sbup * (AccumType)noise_from_hash(seed_base + SEED_OFF_MLP_UP_A, oidx)) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
                 
-                // Add MLP Bias Up
+        
                 WeightType b_up = model->mlp_bias_up[l][oidx];
                 int8_t n_b_up = noise_from_hash(seed_base + SEED_OFF_MLP_BIAS_UP, oidx);
                 
@@ -682,9 +558,6 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             }
             __syncthreads();
 
-            // Down Project
-            // Input is s_mlp (4H).
-            // Need scalar B projection of s_mlp.
             AccumType pbdn = 0;
             for(int sub=0; sub<4; sub++) pbdn += (AccumType)s_mlp[tid + sub*HIDDEN_DIM] * noise_from_hash(seed_base + SEED_OFF_MLP_DOWN_B, tid + sub*HIDDEN_DIM);
             AccumType sbdn = block_reduce_sum_broadcast(pbdn, temp_storage, shared_scalar);
@@ -692,9 +565,6 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             const int32_t *wdn_p = (const int32_t*)model->w_down[l];
             int32_t *v_ptr_dn = (int32_t*)s_mlp;
             AccumType adn = 0;
-            // Down: In=4*HIDDEN. Out=HIDDEN.
-            // Loop limit = 4*HIDDEN / 4 = HIDDEN.
-            // Indexing: k_chunk * HIDDEN + tid.
             for(int k=0; k<HIDDEN_DIM; k++) {
                 adn = simd_dp4a(v_ptr_dn[k], wdn_p[k * HIDDEN_DIM + tid], adn);
             }
@@ -721,28 +591,15 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         // Reuse s_mem[HD] for normed
         ActType *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
-
-        // Output Weight Tying. Use SEED_OFF_EMB consistent with input.
-        // Input perturb: A[token] * B[dim] (tid=dim, input_token=token)
-        // Here: W[k, tid] where k=dim, tid=token.
-        // Perturb: B[k] * A[tid].
-        // So sbh (dim) uses SEED_OFF_EMB + HIDDEN_DIM.
-        // ah noise (token) uses SEED_OFF_EMB.
         
         AccumType sbh = block_reduce_sum_broadcast((AccumType)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_EMB + HIDDEN_DIM, tid), temp_storage, shared_scalar);
 
-        // Compute Logits with new softmax (max-subtraction for stability)
-        // Use shared memory for logits and max finding
         int32_t *s_logits = (int32_t*)&s_mem[2*HIDDEN_DIM];
         __shared__ int32_t s_logit_max;
         
         if(tid < VOCAB_SIZE) {
             AccumType ah = 0;
-            // Weight Tying: Use model->embedding instead of head.
-            // model->embedding layout: [HIDDEN_DIM, VOCAB_SIZE] (transposed in init)
-            // Index: k * VOCAB_SIZE + tid. Matches exactly.
-            // Final proj uses Embedding weights.
-            // Repacked: In=HIDDEN, Out=VOCAB.
+
             const int32_t *wh_p = (const int32_t*)model->embedding;
             int32_t *v_ptr_h = (int32_t*)s_norm;
             // Index: k_chunk * VOCAB + tid.
@@ -776,9 +633,6 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
             uint64_t sum_ex = 0;
             for(int i=0; i<VOCAB_SIZE; i++) sum_ex += ((int32_t*)s_x)[i];
             
-            // Cross-entropy loss: -log(p_target) = -log(exp(x_t)/sum) = log(sum) - x_t
-            // With new scale, sum is in 2^20 units
-            // log2(sum) approximation for loss computation
             int64_t log_sum = 0;
             if (sum_ex > 0) {
                 uint64_t x = sum_ex; int pos = 0;
@@ -829,23 +683,6 @@ __global__ void update_matrix_adam_kernel(
 
     int change = 0;
     if (idx < rows * cols) {
-        // Packed Layout Decoding
-        // W is packed as [In/4][Out][4].
-        // idx is linear byte index.
-        // int32 word index = idx / 4.
-        // byte offset = idx % 4.
-        // Word layout: k_chunk * cols + tid.
-        // k_chunk = (idx/4) / cols
-        // tid = (idx/4) % cols
-        // k = k_chunk * 4 + byte_offset
-        // Here 'cols' is Output Dim. 'rows' is Input Dim.
-        // Noise mapping:
-        // Originally: weight at [k][tid] used noise(k) and noise(tid).
-        // r was passed as row index (Input/k), c as col index (Output/tid).
-        // Wait. Original: idx = r * cols + c -> idx = k * HIDDEN + tid.
-        // So r corresponds to k. c corresponds to tid.
-        // And noise A was c(tid). Noise B was r(k).
-        
         int byte_off = idx & 3;
         int word_idx = idx >> 2;
         int tid = word_idx % cols; // Output Dim (c)
@@ -861,13 +698,6 @@ __global__ void update_matrix_adam_kernel(
             vote += (VoteType)fit * noise_from_hash(s + off_A, tid) * noise_from_hash(s + off_B, k);
         }
         
-        // Gradient is negative of vote (since vote > 0 suggests moving in that direction improves fitness)
-        // If fitness=1 (positive noise better), we want to go in +noise direction.
-        // vote accumulates +noise. So vote is the step. 
-        // Standard GD: w = w - lr * grad. 
-        // Equiv to: w = w + lr * (-grad).
-        // identifying "vote" as (-grad).
-        
         float g = -(float)vote; 
 
         // Load Adam State
@@ -876,11 +706,6 @@ __global__ void update_matrix_adam_kernel(
         // Update Moments
         p.m = ADAM_BETA1 * p.m + (1.0f - ADAM_BETA1) * g;
         p.v = ADAM_BETA2 * p.v + (1.0f - ADAM_BETA2) * (g * g);
-        
-        // Bias Correction (Simplified: assume simplified or pre-bias-corrected for long steps)
-        // For efficiency in chaotic integer training, often skipped or approximated, 
-        // but let's do standard Bias Correction if we track steps, or just Raw Adam for simplicity 
-        // given the massive noise. Let's stick to raw M/sqrt(V).
         
         float m_hat = p.m; // / (1 - beta1^t)
         float v_hat = p.v; // / (1 - beta2^t)
