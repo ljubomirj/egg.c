@@ -56,7 +56,7 @@ void handle_sigint(int sig) {
 #define SOFTMAX_EXP_SCALE 11.54
 
 // RoPE Configuration
-#define ROPE_SCALE_BIT 16
+#define ROPE_SCALE_BIT 30
 #define ROPE_SCALE (1 << ROPE_SCALE_BIT)
 #define ROPE_LUT_SIZE (SEQ_LEN * (HEAD_DIM / 2) * 2)
 
@@ -410,9 +410,6 @@ __device__ __forceinline__ AccumType block_reduce_sum_broadcast(AccumType val, B
     return ret;
 }
 
-
-// debug_stat moved to egg_debug_printer.h
-
 __device__ __forceinline__ AccumType apply_rope_integer(AccumType val, int t, int tid) {
 
     int head_dim_idx = tid % HEAD_DIM;
@@ -427,9 +424,9 @@ __device__ __forceinline__ AccumType apply_rope_integer(AccumType val, int t, in
     
     int64_t res;
     if (is_odd == 0) {
-        res = ((int64_t)val * c - (int64_t)neighbor_val * s) >> ROPE_SCALE_BIT;
+        res = ((int64_t)val * c - (int64_t)neighbor_val * s + (1 << (ROPE_SCALE_BIT - 1))) >> ROPE_SCALE_BIT;
     } else {
-        res = ((int64_t)neighbor_val * s + (int64_t)val * c) >> ROPE_SCALE_BIT;
+        res = ((int64_t)neighbor_val * s + (int64_t)val * c + (1 << (ROPE_SCALE_BIT - 1))) >> ROPE_SCALE_BIT;
     }
 
     return (AccumType)res;
@@ -463,7 +460,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
     for (int t = 0; t < SEQ_LEN; t++) {
         
-        if (step%5 == 0 && blockIdx.x == 0 && tid == 0 && t == 0) {
+        if (step%5 == 0 && global_pop_offset == 0 && blockIdx.x == 0 && tid == 0 && t == 0) {
              printf("DEBUG: Dataset[0..10] at stream_pos=%ld: ", stream_pos);
              for(int i=0; i<10 && stream_pos+i < data_len; i++) printf("%d(%c) ", dataset[stream_pos+i], (dataset[stream_pos+i]>=32 && dataset[stream_pos+i]<=126) ? dataset[stream_pos+i] : '.');
              printf("\n");

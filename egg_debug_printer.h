@@ -143,11 +143,11 @@ __device__ inline void debug_attn_probe_impl(long step, int l, int h, int t, int
 
 // --- Macros ---
 // Condition: Thread 0 only, Block 0 only, T=32 only (to sample a decently long sequence)
-#define EGG_TRACE_COND (blockIdx.x == 0 && threadIdx.x == 0 && t == 32)
+#define EGG_TRACE_COND (blockIdx.x == 0 && threadIdx.x == 0 && t == 32 && global_pop_offset == 0)
 // For Attention, we need to init inside the head loop (tid loops over heads)
 // But Thread 0 handles Head 0. Thread 1 handles Head 1.
 // We only want to debug Head 0. So tid==0 is correct for Head 0.
-#define EGG_ATTN_COND (blockIdx.x == 0 && threadIdx.x == 0 && t == 32)
+#define EGG_ATTN_COND (blockIdx.x == 0 && threadIdx.x == 0 && t == 32 && global_pop_offset == 0)
 
 #define EGG_TRACE_STAT(step, t, l, name, data, len) \
     if (EGG_TRACE_COND) { \
@@ -159,7 +159,7 @@ __device__ inline void debug_attn_probe_impl(long step, int l, int h, int t, int
 #define EGG_TRACE_ATTN_ACCUM(name, wt) if (EGG_ATTN_COND) debug_attn_accum_impl(&name, wt)
 #define EGG_TRACE_ATTN_FINISH(name, step, l, h, t) if (EGG_ATTN_COND) debug_attn_finish_impl(&name, step, l, h, t)
 #define EGG_TRACE_ATTN_PROBE(step, l, h, t, ctx, sc, max, shifted, wt) \
-    if (blockIdx.x == 0 && threadIdx.x == 0) { \
+    if (blockIdx.x == 0 && threadIdx.x == 0 && global_pop_offset == 0) { \
         debug_attn_probe_impl(step, l, h, t, ctx, sc, max, shifted, wt); \
     }
 
