@@ -23,6 +23,7 @@ typedef struct {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> matmulPipeline;
+    id<MTLComputePipelineState> matmulNoisebPipeline;  // New: computes xB on GPU
     id<MTLComputePipelineState> updatePipeline;
     id<MTLComputePipelineState> clippedAddPipeline;
     id<MTLComputePipelineState> clippedAddScalarPipeline;
@@ -30,6 +31,9 @@ typedef struct {
     id<MTLComputePipelineState> layerNormPipeline;
     id<MTLComputePipelineState> gruGatePipeline;
     id<MTLComputePipelineState> gruStateUpdatePipeline;
+    id<MTLComputePipelineState> gruFusedPipeline;
+    id<MTLComputePipelineState> mlpFusedPipeline;
+    id<MTLComputePipelineState> headFusedPipeline;
     id<MTLComputePipelineState> dotProductPipeline;
     id<MTLBuffer> inputBuffer;
     NSUInteger inputCapacity;
@@ -67,6 +71,24 @@ typedef struct {
     NSUInteger    updateACapacity;
     id<MTLBuffer> updateBBuffer;
     NSUInteger    updateBCapacity;
+    // Fused GRU temporaries
+    id<MTLBuffer> gruNoiseABuffer;
+    NSUInteger    gruNoiseACapacity;
+    id<MTLBuffer> gruNoiseBBuffer;
+    NSUInteger    gruNoiseBCapacity;
+    id<MTLBuffer> gruParamsBuffer;
+    // Fused MLP temporaries
+    id<MTLBuffer> mlpNoiseABuffer;
+    NSUInteger    mlpNoiseACapacity;
+    id<MTLBuffer> mlpNoiseBBuffer;
+    NSUInteger    mlpNoiseBCapacity;
+    id<MTLBuffer> mlpParamsBuffer;
+    // Fused Head temporaries
+    id<MTLBuffer> headNoiseABuffer;
+    NSUInteger    headNoiseACapacity;
+    id<MTLBuffer> headNoiseBBuffer;
+    NSUInteger    headNoiseBCapacity;
+    id<MTLBuffer> headParamsBuffer;
     dispatch_semaphore_t lock;
 } EggMetalContext;
 
@@ -77,6 +99,7 @@ struct EggMetalPendingRead {
     id<MTLBuffer> buffer;
     void *hostPtr;
     size_t size;
+    size_t offset;
 };
 
 // Thread-local batching state
@@ -142,6 +165,23 @@ typedef struct {
     int32_t threshold;
 } EggMetalUpdateParams;
 
+typedef struct {
+    int32_t noise_sign;
+    int32_t shift;
+} EggMetalGruParams;
+
+typedef struct {
+    int32_t noise_sign;
+    int32_t shift_expand;
+    int32_t shift_project;
+} EggMetalMlpParams;
+
+typedef struct {
+    int32_t noise_sign;
+    int32_t shift;
+    int32_t output_offset;
+} EggMetalHeadParams;
+
 static NSString *EggMetalShaderSource(void) {
     return [NSString stringWithFormat:
         @"#include <metal_stdlib>\n"
@@ -150,6 +190,7 @@ static NSString *EggMetalShaderSource(void) {
          "#define SIGMA_SHIFT %d\n"
          "#define MAX_VAL %d\n"
          "#define MIN_VAL %d\n"
+         "#define HIDDEN_DIM %d\n"
          "struct EggMetalMatmulParams {\n"
          "  int rows;\n"
          "  int cols;\n"
@@ -164,6 +205,20 @@ static NSString *EggMetalShaderSource(void) {
          "  int strideA;\n"
          "  int strideB;\n"
          "  int threshold;\n"
+         "};\n"
+         "struct EggMetalGruParams {\n"
+         "  int noise_sign;\n"
+         "  int shift;\n"
+         "};\n"
+         "struct EggMetalMlpParams {\n"
+         "  int noise_sign;\n"
+         "  int shift_expand;\n"
+         "  int shift_project;\n"
+         "};\n"
+         "struct EggMetalHeadParams {\n"
+         "  int noise_sign;\n"
+         "  int shift;\n"
+         "  int output_offset;\n"
          "};\n"
          "kernel void egg_matmul_perturbed_kernel(\n"
          "    device const char *input [[buffer(0)]],\n"
@@ -180,6 +235,42 @@ static NSString *EggMetalShaderSource(void) {
          "  }\n"
          "  if (params.noise_sign != 0) {\n"
          "    int noise = (params.xB * int(noiseA[gid])) * params.noise_sign;\n"
+         "    acc += (noise >> (FIXED_POINT + SIGMA_SHIFT));\n"
+         "  }\n"
+         "  int res = acc >> params.shift;\n"
+         "  res = min(res, MAX_VAL);\n"
+         "  res = max(res, MIN_VAL);\n"
+         "  output[gid] = char(res);\n"
+         "}\n"
+         "// New kernel that computes xB internally - no CPU sync needed!\n"
+         "kernel void egg_matmul_noiseb_kernel(\n"
+         "    device const char *input [[buffer(0)]],\n"
+         "    device const char *weights [[buffer(1)]],\n"
+         "    device char *output [[buffer(2)]],\n"
+         "    device const char *noiseA [[buffer(3)]],\n"
+         "    device const char *noiseB [[buffer(4)]],\n"
+         "    constant EggMetalMatmulParams &params [[buffer(5)]],\n"
+         "    uint gid [[thread_position_in_grid]],\n"
+         "    uint tid [[thread_index_in_threadgroup]],\n"
+         "    uint tg_size [[threads_per_threadgroup]]) {\n"
+         "  // Compute xB using thread 0 (simple approach for correctness)\n"
+         "  threadgroup int shared_xB;\n"
+         "  if (tid == 0) {\n"
+         "    int xB = 0;\n"
+         "    for (int c = 0; c < params.cols; ++c) {\n"
+         "      xB += int(input[c]) * int(noiseB[c]);\n"
+         "    }\n"
+         "    shared_xB = xB;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (gid >= params.rows) { return; }\n"
+         "  const device char *row = weights + gid * params.cols;\n"
+         "  int acc = 0;\n"
+         "  for (int c = 0; c < params.cols; ++c) {\n"
+         "    acc += int(input[c]) * int(row[c]);\n"
+         "  }\n"
+         "  if (params.noise_sign != 0) {\n"
+         "    int noise = (shared_xB * int(noiseA[gid])) * params.noise_sign;\n"
          "    acc += (noise >> (FIXED_POINT + SIGMA_SHIFT));\n"
          "  }\n"
          "  int res = acc >> params.shift;\n"
@@ -242,18 +333,15 @@ static NSString *EggMetalShaderSource(void) {
          "    uint gid [[thread_position_in_grid]],\n"
          "    uint count [[threads_per_grid]]) {\n"
          "  if (gid >= count) return;\n"
-         "  // Compute sum of absolute values\n"
          "  int sum = 0;\n"
          "  for (uint i = 0; i < *dim; ++i) {\n"
          "    int val = int(x[i]);\n"
          "    sum += (val < 0) ? -val : val;\n"
          "  }\n"
-         "  if (sum == 0) sum = 1;\n"
          "  int mean = sum / int(*dim);\n"
-         "  // Normalize and scale\n"
+         "  if (mean == 0) mean = 1;\n"
          "  int val = int(x[gid]);\n"
-         "  int normalized = (val << 8) / mean;\n"
-         "  int scaled = (normalized * int(w[gid])) >> 8;\n"
+         "  int scaled = (val * int(w[gid])) / mean;\n"
          "  scaled = min(scaled, MAX_VAL);\n"
          "  scaled = max(scaled, MIN_VAL);\n"
          "  out[gid] = char(scaled);\n"
@@ -343,11 +431,262 @@ static NSString *EggMetalShaderSource(void) {
          "  if (tid == 0) {\n"
          "    partial_sums[group_id] = shared_data[0];\n"
          "  }\n"
+         "}\n"
+         "kernel void egg_gru_fused_kernel(\n"
+         "    device char *x [[buffer(0)]],\n"
+         "    device char *h [[buffer(1)]],\n"
+         "    device const char *W0 [[buffer(2)]],\n"
+         "    device const char *W1 [[buffer(3)]],\n"
+         "    device const char *W2 [[buffer(4)]],\n"
+         "    device const char *W3 [[buffer(5)]],\n"
+         "    device const char *bias0 [[buffer(6)]],\n"
+         "    device const char *bias1 [[buffer(7)]],\n"
+         "    device const char *ln_w [[buffer(8)]],\n"
+         "    device const char *noiseA_all [[buffer(9)]],\n"
+         "    device const char *noiseB_all [[buffer(10)]],\n"
+         "    constant EggMetalGruParams &params [[buffer(11)]],\n"
+         "    uint gid [[thread_position_in_grid]],\n"
+         "    uint tid [[thread_index_in_threadgroup]]) {\n"
+         "  if (gid >= HIDDEN_DIM) return;\n"
+         "  threadgroup char x_raw[HIDDEN_DIM];\n"
+         "  threadgroup char h_vec[HIDDEN_DIM];\n"
+         "  threadgroup char x_norm[HIDDEN_DIM];\n"
+         "  threadgroup char gp_vec[HIDDEN_DIM];\n"
+         "  threadgroup int shared_scalars[4];\n"
+         "  x_raw[gid] = x[gid];\n"
+         "  h_vec[gid] = h[gid];\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tid == 0) {\n"
+         "    int sum = 0;\n"
+         "    for (uint i = 0; i < HIDDEN_DIM; i++) {\n"
+         "      int v = int(x_raw[i]);\n"
+         "      sum += (v < 0) ? -v : v;\n"
+         "    }\n"
+         "    int mean = sum / HIDDEN_DIM;\n"
+         "    if (mean == 0) mean = 1;\n"
+         "    shared_scalars[0] = mean;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  int mean = shared_scalars[0];\n"
+         "  int xn = (int(x_raw[gid]) * int(ln_w[gid])) / mean;\n"
+         "  xn = min(xn, MAX_VAL);\n"
+         "  xn = max(xn, MIN_VAL);\n"
+         "  x_norm[gid] = char(xn);\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tid == 0) {\n"
+         "    int xB1 = 0, xB2 = 0;\n"
+         "    const device char *nb1 = noiseB_all + 0 * HIDDEN_DIM;\n"
+         "    const device char *nb2 = noiseB_all + 1 * HIDDEN_DIM;\n"
+         "    for (uint i = 0; i < HIDDEN_DIM; i++) {\n"
+         "      xB1 += int(x_norm[i]) * int(nb1[i]);\n"
+         "      xB2 += int(h_vec[i]) * int(nb2[i]);\n"
+         "    }\n"
+         "    shared_scalars[1] = xB1;\n"
+         "    shared_scalars[2] = xB2;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  int xB1 = shared_scalars[1];\n"
+         "  int xB2 = shared_scalars[2];\n"
+         "  const device char *w0_row = W0 + gid * HIDDEN_DIM;\n"
+         "  const device char *w1_row = W1 + gid * HIDDEN_DIM;\n"
+         "  int acc0 = 0;\n"
+         "  int acc1 = 0;\n"
+         "  for (uint c = 0; c < HIDDEN_DIM; c++) {\n"
+         "    acc0 += int(x_norm[c]) * int(w0_row[c]);\n"
+         "    acc1 += int(h_vec[c]) * int(w1_row[c]);\n"
+         "  }\n"
+         "  const device char *na1 = noiseA_all + 0 * HIDDEN_DIM;\n"
+         "  const device char *na2 = noiseA_all + 1 * HIDDEN_DIM;\n"
+         "  acc0 += (params.noise_sign * ((xB1 * int(na1[gid])) >> (FIXED_POINT + SIGMA_SHIFT)));\n"
+         "  acc1 += (params.noise_sign * ((xB2 * int(na2[gid])) >> (FIXED_POINT + SIGMA_SHIFT)));\n"
+         "  int ft = (acc0 >> params.shift) + (acc1 >> params.shift) + int(bias0[gid]);\n"
+         "  ft = min(ft, MAX_VAL);\n"
+         "  ft = max(ft, MIN_VAL);\n"
+         "  gp_vec[gid] = char(ft);\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  gp_vec[gid] = char(min(max(((int(ft) + 127) * int(h_vec[gid])) >> 8, MIN_VAL), MAX_VAL));\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tid == 0) {\n"
+         "    int xB3 = 0, xB4 = 0;\n"
+         "    const device char *nb3 = noiseB_all + 2 * HIDDEN_DIM;\n"
+         "    const device char *nb4 = noiseB_all + 3 * HIDDEN_DIM;\n"
+         "    for (uint i = 0; i < HIDDEN_DIM; i++) {\n"
+         "      xB3 += int(x_norm[i]) * int(nb3[i]);\n"
+         "      xB4 += int(gp_vec[i]) * int(nb4[i]);\n"
+         "    }\n"
+         "    shared_scalars[1] = xB3;\n"
+         "    shared_scalars[2] = xB4;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  int xB3 = shared_scalars[1];\n"
+         "  int xB4 = shared_scalars[2];\n"
+         "  const device char *w2_row = W2 + gid * HIDDEN_DIM;\n"
+         "  const device char *w3_row = W3 + gid * HIDDEN_DIM;\n"
+         "  int acc2 = 0;\n"
+         "  int acc3 = 0;\n"
+         "  for (uint c = 0; c < HIDDEN_DIM; c++) {\n"
+         "    acc2 += int(x_norm[c]) * int(w2_row[c]);\n"
+         "    acc3 += int(gp_vec[c]) * int(w3_row[c]);\n"
+         "  }\n"
+         "  const device char *na3 = noiseA_all + 2 * HIDDEN_DIM;\n"
+         "  const device char *na4 = noiseA_all + 3 * HIDDEN_DIM;\n"
+         "  acc2 += (params.noise_sign * ((xB3 * int(na3[gid])) >> (FIXED_POINT + SIGMA_SHIFT)));\n"
+         "  acc3 += (params.noise_sign * ((xB4 * int(na4[gid])) >> (FIXED_POINT + SIGMA_SHIFT)));\n"
+         "  int ht = (acc2 >> params.shift) + (acc3 >> params.shift) + int(bias1[gid]);\n"
+         "  ht = min(ht, MAX_VAL);\n"
+         "  ht = max(ht, MIN_VAL);\n"
+         "  int h_old = int(h_vec[gid]);\n"
+         "  int update = ((int(ft) + 127) * (ht - h_old)) >> 8;\n"
+         "  int h_new = h_old + update;\n"
+         "  h_new = min(h_new, MAX_VAL);\n"
+         "  h_new = max(h_new, MIN_VAL);\n"
+         "  int x_out = h_new + int(x_raw[gid]);\n"
+         "  x_out = min(x_out, MAX_VAL);\n"
+         "  x_out = max(x_out, MIN_VAL);\n"
+         "  h[gid] = char(h_new);\n"
+         "  x[gid] = char(x_out);\n"
+         "}\n"
+         "kernel void egg_mlp_fused_kernel(\n"
+         "    device char *x [[buffer(0)]],\n"
+         "    device char *residual [[buffer(1)]],\n"
+         "    device const char *W_expand [[buffer(2)]],\n"
+         "    device const char *W_project [[buffer(3)]],\n"
+         "    device const char *ln_w [[buffer(4)]],\n"
+         "    device const char *noiseA_all [[buffer(5)]],\n"
+         "    device const char *noiseB_all [[buffer(6)]],\n"
+         "    constant EggMetalMlpParams &params [[buffer(7)]],\n"
+         "    uint gid [[thread_position_in_grid]],\n"
+         "    uint tid [[thread_index_in_threadgroup]]) {\n"
+         "  if (gid >= HIDDEN_DIM) return;\n"
+         "  threadgroup char x_raw[HIDDEN_DIM];\n"
+         "  threadgroup char x_norm[HIDDEN_DIM];\n"
+         "  threadgroup char expand_buf[HIDDEN_DIM * 4];\n"
+         "  threadgroup char residual_buf[HIDDEN_DIM];\n"
+         "  threadgroup int shared_scalars[2];\n"
+         "  x_raw[gid] = x[gid];\n"
+         "  residual_buf[gid] = residual[gid];\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tid == 0) {\n"
+         "    int sum = 0;\n"
+         "    for (uint i = 0; i < HIDDEN_DIM; i++) {\n"
+         "      int v = int(x_raw[i]);\n"
+         "      sum += (v < 0) ? -v : v;\n"
+         "    }\n"
+         "    int mean = sum / HIDDEN_DIM;\n"
+         "    if (mean == 0) mean = 1;\n"
+         "    shared_scalars[0] = mean;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  int mean = shared_scalars[0];\n"
+         "  int xn = (int(x_raw[gid]) * int(ln_w[gid])) / mean;\n"
+         "  xn = min(xn, MAX_VAL);\n"
+         "  xn = max(xn, MIN_VAL);\n"
+         "  x_norm[gid] = char(xn);\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  // xB for expand\n"
+         "  if (tid == 0) {\n"
+         "    const device char *nb = noiseB_all + 0 * HIDDEN_DIM;\n"
+         "    int xB = 0;\n"
+         "    for (uint i = 0; i < HIDDEN_DIM; i++) xB += int(x_norm[i]) * int(nb[i]);\n"
+         "    shared_scalars[1] = xB;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  int xB_expand = shared_scalars[1];\n"
+         "  const device char *noiseA_expand = noiseA_all + 0 * HIDDEN_DIM;\n"
+         "  const device char *noiseB_expand = noiseB_all + 0 * HIDDEN_DIM;\n"
+         "  // Expand outputs: each thread computes four outputs\n"
+         "  for (uint k = 0; k < 4; k++) {\n"
+         "    uint out_idx = k * HIDDEN_DIM + gid;\n"
+         "    const device char *w_row = W_expand + out_idx * HIDDEN_DIM;\n"
+         "    int acc = 0;\n"
+         "    for (uint c = 0; c < HIDDEN_DIM; c++) acc += int(x_norm[c]) * int(w_row[c]);\n"
+         "    int noise = (params.noise_sign * ((xB_expand * int(noiseA_expand[out_idx])) >> (FIXED_POINT + SIGMA_SHIFT)));\n"
+         "    int val = (acc + noise) >> params.shift_expand;\n"
+         "    val = min(val, MAX_VAL);\n"
+         "    val = max(val, MIN_VAL);\n"
+         "    expand_buf[out_idx] = char(val);\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  // xB for project\n"
+         "  if (tid == 0) {\n"
+         "    const device char *nbp = noiseB_all + HIDDEN_DIM; // offset by H\n"
+         "    int xB = 0;\n"
+         "    for (uint i = 0; i < HIDDEN_DIM * 4; i++) xB += int(expand_buf[i]) * int(nbp[i]);\n"
+         "    shared_scalars[1] = xB;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  int xB_proj = shared_scalars[1];\n"
+         "  const device char *noiseA_proj = noiseA_all + 4 * HIDDEN_DIM;\n"
+         "  const device char *noiseB_proj = noiseB_all + HIDDEN_DIM;\n"
+         "  const device char *w_proj_row = W_project + gid * (HIDDEN_DIM * 4);\n"
+         "  int accp = 0;\n"
+         "  for (uint c = 0; c < HIDDEN_DIM * 4; c++) accp += int(expand_buf[c]) * int(w_proj_row[c]);\n"
+         "  int noise_proj = params.noise_sign * ((xB_proj * int(noiseA_proj[gid])) >> (FIXED_POINT + SIGMA_SHIFT));\n"
+         "  int valp = (accp + noise_proj) >> params.shift_project;\n"
+         "  valp = min(valp, MAX_VAL);\n"
+         "  valp = max(valp, MIN_VAL);\n"
+         "  // Residual add\n"
+         "  valp += int(residual_buf[gid]);\n"
+         "  valp = min(valp, MAX_VAL);\n"
+         "  valp = max(valp, MIN_VAL);\n"
+         "  x[gid] = char(valp);\n"
+         "}\n"
+         "kernel void egg_head_fused_kernel(\n"
+         "    device const char *x [[buffer(0)]],\n"
+         "    device const char *head [[buffer(1)]],\n"
+         "    device const char *ln_w [[buffer(2)]],\n"
+         "    device const char *noiseA_head [[buffer(3)]],\n"
+         "    device const char *noiseB_head [[buffer(4)]],\n"
+         "    device char *logits [[buffer(5)]],\n"
+         "    constant EggMetalHeadParams &params [[buffer(6)]],\n"
+         "    uint gid [[thread_position_in_grid]],\n"
+         "    uint tid [[thread_index_in_threadgroup]]) {\n"
+         "  if (gid >= %d) return;\n"
+         "  threadgroup char x_raw[HIDDEN_DIM];\n"
+         "  threadgroup char x_norm[HIDDEN_DIM];\n"
+         "  threadgroup int shared_xB;\n"
+         "  if (gid < HIDDEN_DIM) x_raw[gid] = x[gid];\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tid == 0) {\n"
+         "    int sum = 0;\n"
+         "    for (uint i = 0; i < HIDDEN_DIM; i++) {\n"
+         "      int v = int(x_raw[i]);\n"
+         "      sum += (v < 0) ? -v : v;\n"
+         "    }\n"
+         "    int mean = sum / HIDDEN_DIM;\n"
+         "    if (mean == 0) mean = 1;\n"
+         "    shared_xB = mean;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  int mean = shared_xB;\n"
+         "  if (gid < HIDDEN_DIM) {\n"
+         "    int xn = (int(x_raw[gid]) * int(ln_w[gid])) / mean;\n"
+         "    xn = min(xn, MAX_VAL);\n"
+         "    xn = max(xn, MIN_VAL);\n"
+         "    x_norm[gid] = char(xn);\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  if (tid == 0) {\n"
+         "    int xB = 0;\n"
+         "    for (uint i = 0; i < HIDDEN_DIM; i++) xB += int(x_norm[i]) * int(noiseB_head[i]);\n"
+         "    shared_xB = xB;\n"
+         "  }\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  const device char *w_row = head + gid * HIDDEN_DIM;\n"
+         "  int acc = 0;\n"
+         "  for (uint c = 0; c < HIDDEN_DIM; c++) acc += int(x_norm[c]) * int(w_row[c]);\n"
+         "  int noise = params.noise_sign * ((shared_xB * int(noiseA_head[gid])) >> (FIXED_POINT + SIGMA_SHIFT));\n"
+         "  int val = (acc + noise) >> params.shift;\n"
+         "  val = min(val, MAX_VAL);\n"
+         "  val = max(val, MIN_VAL);\n"
+         "  logits[params.output_offset + gid] = char(val);\n"
          "}\n",
         FIXED_POINT,
         SIGMA_SHIFT,
         MAX_VAL,
-        MIN_VAL];
+        MIN_VAL,
+        HIDDEN_DIM,
+        VOCAB_SIZE];
 }
 
 static id<MTLBuffer> EggEnsureBuffer(id<MTLDevice> device,
@@ -432,6 +771,15 @@ extern "C" bool egg_gpu_metal_init(void) {
             return false;
         }
 
+        // Initialize new matmul kernel that computes xB on GPU
+        id<MTLFunction> matmulNoisebFunction = [library newFunctionWithName:@"egg_matmul_noiseb_kernel"];
+        if (matmulNoisebFunction) {
+            g_ctx.matmulNoisebPipeline = [g_ctx.device newComputePipelineStateWithFunction:matmulNoisebFunction error:&error];
+            if (!g_ctx.matmulNoisebPipeline) {
+                EggLogError("newComputePipelineStateWithFunction(matmul_noiseb)", error);
+            }
+        }
+
         id<MTLFunction> updateFunction = [library newFunctionWithName:@"egg_update_matrix_kernel"];
         if (!updateFunction) {
             fprintf(stderr, "[EGG METAL] Failed to create update kernel function.\n");
@@ -488,6 +836,30 @@ extern "C" bool egg_gpu_metal_init(void) {
             g_ctx.gruStateUpdatePipeline = [g_ctx.device newComputePipelineStateWithFunction:gruStateUpdateFunc error:&error];
             if (!g_ctx.gruStateUpdatePipeline) {
                 EggLogError("newComputePipelineStateWithFunction(gru_state_update)", error);
+            }
+        }
+
+        id<MTLFunction> gruFusedFunc = [library newFunctionWithName:@"egg_gru_fused_kernel"];
+        if (gruFusedFunc) {
+            g_ctx.gruFusedPipeline = [g_ctx.device newComputePipelineStateWithFunction:gruFusedFunc error:&error];
+            if (!g_ctx.gruFusedPipeline) {
+                EggLogError("newComputePipelineStateWithFunction(gru_fused)", error);
+            }
+        }
+
+        id<MTLFunction> mlpFusedFunc = [library newFunctionWithName:@"egg_mlp_fused_kernel"];
+        if (mlpFusedFunc) {
+            g_ctx.mlpFusedPipeline = [g_ctx.device newComputePipelineStateWithFunction:mlpFusedFunc error:&error];
+            if (!g_ctx.mlpFusedPipeline) {
+                EggLogError("newComputePipelineStateWithFunction(mlp_fused)", error);
+            }
+        }
+
+        id<MTLFunction> headFusedFunc = [library newFunctionWithName:@"egg_head_fused_kernel"];
+        if (headFusedFunc) {
+            g_ctx.headFusedPipeline = [g_ctx.device newComputePipelineStateWithFunction:headFusedFunc error:&error];
+            if (!g_ctx.headFusedPipeline) {
+                EggLogError("newComputePipelineStateWithFunction(head_fused)", error);
             }
         }
 
@@ -627,8 +999,26 @@ extern "C" void egg_gpu_metal_shutdown(void) {
     g_ctx.updateBBuffer = nil;
     g_ctx.updateACapacity = 0;
     g_ctx.updateBCapacity = 0;
+    g_ctx.gruNoiseABuffer = nil;
+    g_ctx.gruNoiseACapacity = 0;
+    g_ctx.gruNoiseBBuffer = nil;
+    g_ctx.gruNoiseBCapacity = 0;
+    g_ctx.gruParamsBuffer = nil;
+    g_ctx.mlpNoiseABuffer = nil;
+    g_ctx.mlpNoiseACapacity = 0;
+    g_ctx.mlpNoiseBBuffer = nil;
+    g_ctx.mlpNoiseBCapacity = 0;
+    g_ctx.mlpParamsBuffer = nil;
+    g_ctx.headNoiseABuffer = nil;
+    g_ctx.headNoiseACapacity = 0;
+    g_ctx.headNoiseBBuffer = nil;
+    g_ctx.headNoiseBCapacity = 0;
+    g_ctx.headParamsBuffer = nil;
     g_ctx.matmulPipeline = nil;
     g_ctx.updatePipeline = nil;
+    g_ctx.gruFusedPipeline = nil;
+    g_ctx.mlpFusedPipeline = nil;
+    g_ctx.headFusedPipeline = nil;
     g_ctx.queue = nil;
     g_ctx.device = nil;
     g_ctx.inputCapacity = 0;
@@ -703,44 +1093,39 @@ extern "C" void egg_gpu_batch_end(void) {
         }
     }
     
-    if (needsSync) {
-        // Only wait if we have Private buffers
-        dispatch_semaphore_t readSem = dispatch_semaphore_create(0);
-        [state->commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-            for (int i = 0; i < state->pendingReadCount; i++) {
-                if (state->pendingReads[i].buffer && state->pendingReads[i].hostPtr) {
-                    id<MTLBuffer> buf = state->pendingReads[i].buffer;
-                    if ([buf storageMode] == MTLStorageModePrivate) {
-                        memcpy(state->pendingReads[i].hostPtr,
-                               [state->pendingReads[i].buffer contents],
-                               state->pendingReads[i].size);
-                    }
-                }
-            }
-            dispatch_semaphore_signal(readSem);
-        }];
-        [state->commandBuffer commit];
-        dispatch_semaphore_wait(readSem, DISPATCH_TIME_FOREVER);
-    } else {
-        // For Shared buffers, commit async and read immediately
-        [state->commandBuffer commit];
-        // Read back immediately (Shared buffers are CPU-visible)
+    // Always wait for completion so host views are coherent
+    dispatch_semaphore_t readSem = dispatch_semaphore_create(0);
+    [state->commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
         for (int i = 0; i < state->pendingReadCount; i++) {
             if (state->pendingReads[i].buffer && state->pendingReads[i].hostPtr) {
-                id<MTLBuffer> buf = state->pendingReads[i].buffer;
-                if ([buf storageMode] == MTLStorageModeShared) {
-                    memcpy(state->pendingReads[i].hostPtr,
-                           [buf contents],
-                           state->pendingReads[i].size);
-                }
+                memcpy(state->pendingReads[i].hostPtr,
+                       (uint8_t *)[state->pendingReads[i].buffer contents] + state->pendingReads[i].offset,
+                       state->pendingReads[i].size);
             }
         }
-    }
+        dispatch_semaphore_signal(readSem);
+    }];
+    [state->commandBuffer commit];
+    dispatch_semaphore_wait(readSem, DISPATCH_TIME_FOREVER);
     
     state->commandBuffer = nil;
     state->inBatch = false;
     state->operationCount = 0;
     state->pendingReadCount = 0;
+}
+
+extern "C" void egg_gpu_batch_sync(void) {
+    // Flush current batch, wait for completion, then start new batch.
+    // This is needed when CPU code needs to read from GPU buffers mid-forward-pass.
+    if (!g_ctx.ready) return;
+    EggMetalBatchState *state = EggMetalGetBatchState();
+    if (!state->inBatch) return;
+
+    // End current batch and wait for completion
+    egg_gpu_batch_end();
+
+    // Start a new batch
+    egg_gpu_batch_begin();
 }
 
 extern "C" bool egg_gpu_matmul_perturbed(
@@ -752,7 +1137,8 @@ extern "C" bool egg_gpu_matmul_perturbed(
     int cols,
     int shift,
     int noise_sign,
-    int32_t xB
+    int32_t xB,
+    size_t output_offset
 ) {
     if (!g_ctx.ready) return false;
     if (rows <= 0 || cols <= 0) return false;
@@ -761,9 +1147,10 @@ extern "C" bool egg_gpu_matmul_perturbed(
     dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
     NSUInteger inputBytes  = (NSUInteger)cols;
     NSUInteger outputBytes = (NSUInteger)rows;
+    NSUInteger requiredOutput = outputBytes + output_offset;
 
     id<MTLBuffer> inputBuffer  = EggEnsureBuffer(g_ctx.device, &g_ctx.inputBuffer, &g_ctx.inputCapacity, inputBytes);
-    id<MTLBuffer> outputBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.outputBuffer, &g_ctx.outputCapacity, outputBytes);
+    id<MTLBuffer> outputBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.outputBuffer, &g_ctx.outputCapacity, requiredOutput);
     id<MTLBuffer> noiseBuffer  = EggEnsureBuffer(g_ctx.device, &g_ctx.noiseBuffer, &g_ctx.noiseCapacity, outputBytes);
     id<MTLBuffer> paramsBuffer = g_ctx.paramsBuffer;
     if (!paramsBuffer) {
@@ -836,7 +1223,7 @@ extern "C" bool egg_gpu_matmul_perturbed(
         } else {
             [encoder setBuffer:weightBuffer offset:0 atIndex:1];
         }
-        [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+        [encoder setBuffer:outputBuffer offset:output_offset atIndex:2];
         [encoder setBuffer:noiseBuffer offset:0 atIndex:3];
         [encoder setBuffer:paramsBuffer offset:0 atIndex:4];
 
@@ -856,7 +1243,7 @@ extern "C" bool egg_gpu_matmul_perturbed(
             [commandBuffer waitUntilCompleted];
             
             // Read results (buffers are still valid)
-            memcpy(output, [outputBuffer contents], outputBytes);
+            memcpy(output, (uint8_t *)[outputBuffer contents] + output_offset, outputBytes);
         } else {
             // Batched: register output for read-back after batch_end
             // Safety check: ensure pendingReads is allocated
@@ -885,6 +1272,7 @@ extern "C" bool egg_gpu_matmul_perturbed(
             batchState->pendingReads[batchState->pendingReadCount].buffer = outputBuffer;
             batchState->pendingReads[batchState->pendingReadCount].hostPtr = output;
             batchState->pendingReads[batchState->pendingReadCount].size = outputBytes;
+            batchState->pendingReads[batchState->pendingReadCount].offset = output_offset;
             batchState->pendingReadCount++;
         }
     }
@@ -901,7 +1289,8 @@ extern "C" bool egg_gpu_matmul_perturbed_gpu(
     int cols,
     int shift,
     int noise_sign,
-    int32_t xB
+    int32_t xB,
+    size_t output_offset
 ) {
     if (!g_ctx.ready) return false;
     if (rows <= 0 || cols <= 0) return false;
@@ -909,8 +1298,9 @@ extern "C" bool egg_gpu_matmul_perturbed_gpu(
     id<MTLBuffer> inputBuffer = (__bridge id<MTLBuffer>)input_gpu;
     id<MTLBuffer> outputBuffer = (__bridge id<MTLBuffer>)output_gpu;
     
+    NSUInteger requiredOutput = (NSUInteger)rows + output_offset;
     if (!inputBuffer || !outputBuffer) return false;
-    if ([inputBuffer length] < (NSUInteger)cols || [outputBuffer length] < (NSUInteger)rows) return false;
+    if ([inputBuffer length] < (NSUInteger)cols || [outputBuffer length] < requiredOutput) return false;
     
     // Lock only for buffer allocation
     dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
@@ -980,7 +1370,7 @@ extern "C" bool egg_gpu_matmul_perturbed_gpu(
         } else {
             [encoder setBuffer:weightBuffer offset:0 atIndex:1];
         }
-        [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+        [encoder setBuffer:outputBuffer offset:output_offset atIndex:2];
         [encoder setBuffer:noiseBuffer offset:0 atIndex:3];
         [encoder setBuffer:paramsBuffer offset:0 atIndex:4];
         
@@ -999,6 +1389,128 @@ extern "C" bool egg_gpu_matmul_perturbed_gpu(
             [commandBuffer waitUntilCompleted];
         }
         // In batch mode, output stays on GPU - no read-back needed
+    }
+    return true;
+}
+
+// NEW: GPU matmul that computes xB on GPU - no CPU sync needed!
+extern "C" bool egg_gpu_matmul_noiseb(
+    void *input_gpu,
+    const int8_t *weights,
+    void *output_gpu,
+    const int8_t *noise_a,
+    const int8_t *noise_b,
+    int rows,
+    int cols,
+    int shift,
+    int noise_sign,
+    size_t output_offset
+) {
+    if (!g_ctx.ready || !g_ctx.matmulNoisebPipeline) return false;
+    if (rows <= 0 || cols <= 0) return false;
+
+    id<MTLBuffer> inputBuffer = (__bridge id<MTLBuffer>)input_gpu;
+    id<MTLBuffer> outputBuffer = (__bridge id<MTLBuffer>)output_gpu;
+
+    NSUInteger requiredOutput = (NSUInteger)rows + output_offset;
+    if (!inputBuffer || !outputBuffer) return false;
+    if ([inputBuffer length] < (NSUInteger)cols || [outputBuffer length] < requiredOutput) return false;
+
+    // Lock for buffer allocation
+    dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    NSUInteger outputBytes = (NSUInteger)rows;
+
+    // Allocate noise buffers
+    id<MTLBuffer> noiseABuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.noiseBuffer, &g_ctx.noiseCapacity, outputBytes);
+
+    // NoiseB buffer - need cols bytes
+    static id<MTLBuffer> noiseBBuffer = nil;
+    static NSUInteger noiseBCapacity = 0;
+    noiseBBuffer = EggEnsureBuffer(g_ctx.device, &noiseBBuffer, &noiseBCapacity, (NSUInteger)cols);
+
+    id<MTLBuffer> paramsBuffer = g_ctx.paramsBuffer;
+    if (!paramsBuffer) {
+        paramsBuffer = [g_ctx.device newBufferWithLength:sizeof(EggMetalMatmulParams)
+                                                options:MTLResourceStorageModeShared];
+        g_ctx.paramsBuffer = paramsBuffer;
+    }
+
+    // Prefer model buffer for weights
+    NSUInteger wOffset = 0;
+    bool useModelBuffer = (g_ctx.modelBuffer && EggResolveModelWeightOffset(weights, &wOffset));
+    id<MTLBuffer> weightBuffer = nil;
+    NSUInteger weightBytes = 0;
+    if (!useModelBuffer) {
+        weightBytes = (NSUInteger)rows * (NSUInteger)cols;
+        weightBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.weightBuffer, &g_ctx.weightCapacity, weightBytes);
+    }
+
+    if (!noiseABuffer || !noiseBBuffer || !paramsBuffer || (!useModelBuffer && !weightBuffer)) {
+        dispatch_semaphore_signal(g_ctx.lock);
+        return false;
+    }
+
+    // Copy noise data
+    memcpy([noiseABuffer contents], noise_a, outputBytes);
+    memcpy([noiseBBuffer contents], noise_b, (NSUInteger)cols);
+    if (!useModelBuffer) {
+        memcpy([weightBuffer contents], weights, weightBytes);
+    }
+
+    EggMetalMatmulParams params = {};
+    params.rows = rows;
+    params.cols = cols;
+    params.shift = shift;
+    params.noise_sign = noise_sign;
+    params.xB = 0; // Not used - computed on GPU
+    memcpy([paramsBuffer contents], &params, sizeof(EggMetalMatmulParams));
+
+    dispatch_semaphore_signal(g_ctx.lock);
+
+    // GPU work
+    @autoreleasepool {
+        EggMetalBatchState *batchState = EggMetalGetBatchState();
+        bool useBatch = batchState->inBatch && batchState->encoder != nil;
+
+        id<MTLCommandBuffer> commandBuffer = nil;
+        id<MTLComputeCommandEncoder> encoder = nil;
+
+        if (useBatch) {
+            encoder = batchState->encoder;
+            commandBuffer = batchState->commandBuffer;
+            batchState->operationCount++;
+        } else {
+            commandBuffer = [g_ctx.queue commandBuffer];
+            encoder = [commandBuffer computeCommandEncoder];
+            if (!encoder) return false;
+        }
+
+        [encoder setComputePipelineState:g_ctx.matmulNoisebPipeline];
+        [encoder setBuffer:inputBuffer offset:0 atIndex:0];
+        if (useModelBuffer) {
+            [encoder setBuffer:g_ctx.modelBuffer offset:wOffset atIndex:1];
+        } else {
+            [encoder setBuffer:weightBuffer offset:0 atIndex:1];
+        }
+        [encoder setBuffer:outputBuffer offset:output_offset atIndex:2];
+        [encoder setBuffer:noiseABuffer offset:0 atIndex:3];
+        [encoder setBuffer:noiseBBuffer offset:0 atIndex:4];
+        [encoder setBuffer:paramsBuffer offset:0 atIndex:5];
+
+        NSUInteger maxThreads = g_ctx.matmulNoisebPipeline.maxTotalThreadsPerThreadgroup;
+        if (maxThreads < 1) maxThreads = 1;
+        NSUInteger threadsPerGroup = maxThreads < 256 ? maxThreads : 256;
+
+        MTLSize gridSize = MTLSizeMake((NSUInteger)rows, 1, 1);
+        MTLSize threadgroupSize = MTLSizeMake(threadsPerGroup, 1, 1);
+
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+
+        if (!useBatch) {
+            [encoder endEncoding];
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+        }
     }
     return true;
 }
@@ -1264,6 +1776,231 @@ extern "C" bool egg_gpu_gru_state_update(void *gpu_h, void *gpu_ft, void *gpu_ht
     MTLSize threadgroupSize = MTLSizeMake(threadsPerGroup, 1, 1);
     
     [batchState->encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    return true;
+}
+
+extern "C" bool egg_gpu_gru_fused(
+    void *gpu_x,
+    void *gpu_h,
+    const int8_t *W0,
+    const int8_t *W1,
+    const int8_t *W2,
+    const int8_t *W3,
+    const int8_t *bias0,
+    const int8_t *bias1,
+    const int8_t *ln_w,
+    const int8_t *noiseA_all,   // 4 * HIDDEN_DIM
+    const int8_t *noiseB_all,   // 4 * HIDDEN_DIM
+    int noise_sign,
+    int shift
+) {
+    if (!g_ctx.ready || !g_ctx.gruFusedPipeline) return false;
+    EggMetalBatchState *batchState = EggMetalGetBatchState();
+    if (!batchState->inBatch || !batchState->encoder) return false;
+    
+    id<MTLBuffer> bufX = (__bridge id<MTLBuffer>)gpu_x;
+    id<MTLBuffer> bufH = (__bridge id<MTLBuffer>)gpu_h;
+    
+    // Prepare combined noise buffers
+    NSUInteger noiseBytes = (NSUInteger)(HIDDEN_DIM * 4);
+    dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    id<MTLBuffer> bufNoiseA = EggEnsureBuffer(g_ctx.device, &g_ctx.gruNoiseABuffer, &g_ctx.gruNoiseACapacity, noiseBytes);
+    id<MTLBuffer> bufNoiseB = EggEnsureBuffer(g_ctx.device, &g_ctx.gruNoiseBBuffer, &g_ctx.gruNoiseBCapacity, noiseBytes);
+    if (!bufNoiseA || !bufNoiseB) {
+        dispatch_semaphore_signal(g_ctx.lock);
+        return false;
+    }
+    memcpy([bufNoiseA contents], noiseA_all, noiseBytes);
+    memcpy([bufNoiseB contents], noiseB_all, noiseBytes);
+    
+    // Params buffer
+    if (!g_ctx.gruParamsBuffer) {
+        g_ctx.gruParamsBuffer = [g_ctx.device newBufferWithLength:sizeof(EggMetalGruParams)
+                                                         options:MTLResourceStorageModeShared];
+    }
+    EggMetalGruParams params = { noise_sign, shift };
+    memcpy([g_ctx.gruParamsBuffer contents], &params, sizeof(EggMetalGruParams));
+    dispatch_semaphore_signal(g_ctx.lock);
+    
+    // Weight buffers: prefer modelBuffer offsets if available
+    NSUInteger w0_off = 0, w1_off = 0, w2_off = 0, w3_off = 0;
+    bool w0_in_model = g_ctx.modelBuffer && EggResolveModelWeightOffset(W0, &w0_off);
+    bool w1_in_model = g_ctx.modelBuffer && EggResolveModelWeightOffset(W1, &w1_off);
+    bool w2_in_model = g_ctx.modelBuffer && EggResolveModelWeightOffset(W2, &w2_off);
+    bool w3_in_model = g_ctx.modelBuffer && EggResolveModelWeightOffset(W3, &w3_off);
+    
+    [batchState->encoder setComputePipelineState:g_ctx.gruFusedPipeline];
+    [batchState->encoder setBuffer:bufX offset:0 atIndex:0];
+    [batchState->encoder setBuffer:bufH offset:0 atIndex:1];
+    if (w0_in_model) [batchState->encoder setBuffer:g_ctx.modelBuffer offset:w0_off atIndex:2];
+    else [batchState->encoder setBytes:W0 length:HIDDEN_DIM*HIDDEN_DIM atIndex:2];
+    if (w1_in_model) [batchState->encoder setBuffer:g_ctx.modelBuffer offset:w1_off atIndex:3];
+    else [batchState->encoder setBytes:W1 length:HIDDEN_DIM*HIDDEN_DIM atIndex:3];
+    if (w2_in_model) [batchState->encoder setBuffer:g_ctx.modelBuffer offset:w2_off atIndex:4];
+    else [batchState->encoder setBytes:W2 length:HIDDEN_DIM*HIDDEN_DIM atIndex:4];
+    if (w3_in_model) [batchState->encoder setBuffer:g_ctx.modelBuffer offset:w3_off atIndex:5];
+    else [batchState->encoder setBytes:W3 length:HIDDEN_DIM*HIDDEN_DIM atIndex:5];
+    
+    // Bias and LN weights are not in model buffer; upload directly (reuse small shared buffers)
+    static id<MTLBuffer> bias0Buf = nil;
+    static id<MTLBuffer> bias1Buf = nil;
+    static id<MTLBuffer> lnBuf = nil;
+    static NSUInteger biasCap = 0;
+    static NSUInteger lnCap = 0;
+    dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    bias0Buf = EggEnsureBuffer(g_ctx.device, &bias0Buf, &biasCap, (NSUInteger)HIDDEN_DIM);
+    bias1Buf = EggEnsureBuffer(g_ctx.device, &bias1Buf, &biasCap, (NSUInteger)HIDDEN_DIM);
+    lnBuf    = EggEnsureBuffer(g_ctx.device, &lnBuf, &lnCap, (NSUInteger)HIDDEN_DIM);
+    if (!bias0Buf || !bias1Buf || !lnBuf) {
+        dispatch_semaphore_signal(g_ctx.lock);
+        return false;
+    }
+    memcpy([bias0Buf contents], bias0, HIDDEN_DIM);
+    memcpy([bias1Buf contents], bias1, HIDDEN_DIM);
+    memcpy([lnBuf contents], ln_w, HIDDEN_DIM);
+    dispatch_semaphore_signal(g_ctx.lock);
+    
+    [batchState->encoder setBuffer:bias0Buf offset:0 atIndex:6];
+    [batchState->encoder setBuffer:bias1Buf offset:0 atIndex:7];
+    [batchState->encoder setBuffer:lnBuf offset:0 atIndex:8];
+    [batchState->encoder setBuffer:bufNoiseA offset:0 atIndex:9];
+    [batchState->encoder setBuffer:bufNoiseB offset:0 atIndex:10];
+    [batchState->encoder setBuffer:g_ctx.gruParamsBuffer offset:0 atIndex:11];
+    
+    NSUInteger threadsPerGroup = g_ctx.gruFusedPipeline.maxTotalThreadsPerThreadgroup;
+    if (threadsPerGroup < 1) threadsPerGroup = 1;
+    if (threadsPerGroup > 256) threadsPerGroup = 256;
+    MTLSize gridSize = MTLSizeMake((NSUInteger)HIDDEN_DIM, 1, 1);
+    MTLSize tgs = MTLSizeMake(threadsPerGroup, 1, 1);
+    [batchState->encoder dispatchThreads:gridSize threadsPerThreadgroup:tgs];
+    return true;
+}
+
+extern "C" bool egg_gpu_mlp_fused(
+    void *gpu_x,
+    void *gpu_residual,
+    const int8_t *W_expand,
+    const int8_t *W_project,
+    const int8_t *ln_w,
+    const int8_t *noiseA_all,   // 5H
+    const int8_t *noiseB_all,   // 5H
+    int noise_sign
+) {
+    if (!g_ctx.ready || !g_ctx.mlpFusedPipeline) return false;
+    EggMetalBatchState *batchState = EggMetalGetBatchState();
+    if (!batchState->inBatch || !batchState->encoder) return false;
+    
+    id<MTLBuffer> bufX = (__bridge id<MTLBuffer>)gpu_x;
+    id<MTLBuffer> bufResidual = (__bridge id<MTLBuffer>)gpu_residual;
+    
+    dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    NSUInteger noiseABytes = (NSUInteger)(HIDDEN_DIM * 5);
+    NSUInteger noiseBBytes = (NSUInteger)(HIDDEN_DIM * 5);
+    id<MTLBuffer> bufNoiseA = EggEnsureBuffer(g_ctx.device, &g_ctx.mlpNoiseABuffer, &g_ctx.mlpNoiseACapacity, noiseABytes);
+    id<MTLBuffer> bufNoiseB = EggEnsureBuffer(g_ctx.device, &g_ctx.mlpNoiseBBuffer, &g_ctx.mlpNoiseBCapacity, noiseBBytes);
+    if (!bufNoiseA || !bufNoiseB) {
+        dispatch_semaphore_signal(g_ctx.lock);
+        return false;
+    }
+    memcpy([bufNoiseA contents], noiseA_all, noiseABytes);
+    memcpy([bufNoiseB contents], noiseB_all, noiseBBytes);
+    if (!g_ctx.mlpParamsBuffer) {
+        g_ctx.mlpParamsBuffer = [g_ctx.device newBufferWithLength:sizeof(EggMetalMlpParams)
+                                                         options:MTLResourceStorageModeShared];
+    }
+    EggMetalMlpParams params = { noise_sign, 8, 9 };
+    memcpy([g_ctx.mlpParamsBuffer contents], &params, sizeof(EggMetalMlpParams));
+    dispatch_semaphore_signal(g_ctx.lock);
+    
+    NSUInteger wexp_off = 0, wproj_off = 0;
+    bool wexp_in_model = g_ctx.modelBuffer && EggResolveModelWeightOffset(W_expand, &wexp_off);
+    bool wproj_in_model = g_ctx.modelBuffer && EggResolveModelWeightOffset(W_project, &wproj_off);
+    
+    [batchState->encoder setComputePipelineState:g_ctx.mlpFusedPipeline];
+    [batchState->encoder setBuffer:bufX offset:0 atIndex:0];
+    [batchState->encoder setBuffer:bufResidual offset:0 atIndex:1];
+    if (wexp_in_model) [batchState->encoder setBuffer:g_ctx.modelBuffer offset:wexp_off atIndex:2];
+    else [batchState->encoder setBytes:W_expand length:HIDDEN_DIM*HIDDEN_DIM*4 atIndex:2];
+    if (wproj_in_model) [batchState->encoder setBuffer:g_ctx.modelBuffer offset:wproj_off atIndex:3];
+    else [batchState->encoder setBytes:W_project length:HIDDEN_DIM*HIDDEN_DIM*4 atIndex:3];
+    
+    static id<MTLBuffer> lnBuf = nil;
+    static NSUInteger lnCap = 0;
+    dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    lnBuf = EggEnsureBuffer(g_ctx.device, &lnBuf, &lnCap, (NSUInteger)HIDDEN_DIM);
+    if (!lnBuf) { dispatch_semaphore_signal(g_ctx.lock); return false; }
+    memcpy([lnBuf contents], ln_w, HIDDEN_DIM);
+    dispatch_semaphore_signal(g_ctx.lock);
+    
+    [batchState->encoder setBuffer:lnBuf offset:0 atIndex:4];
+    [batchState->encoder setBuffer:bufNoiseA offset:0 atIndex:5];
+    [batchState->encoder setBuffer:bufNoiseB offset:0 atIndex:6];
+    [batchState->encoder setBuffer:g_ctx.mlpParamsBuffer offset:0 atIndex:7];
+    
+    NSUInteger threadsPerGroup = g_ctx.mlpFusedPipeline.maxTotalThreadsPerThreadgroup;
+    if (threadsPerGroup < 1) threadsPerGroup = 1;
+    if (threadsPerGroup > 256) threadsPerGroup = 256;
+    MTLSize gridSize = MTLSizeMake((NSUInteger)HIDDEN_DIM, 1, 1);
+    MTLSize tgs = MTLSizeMake(threadsPerGroup, 1, 1);
+    [batchState->encoder dispatchThreads:gridSize threadsPerThreadgroup:tgs];
+    return true;
+}
+
+extern "C" bool egg_gpu_head_fused(
+    void *gpu_x,
+    const int8_t *head,
+    const int8_t *ln_out,
+    const int8_t *noiseA_head,
+    const int8_t *noiseB_head,
+    int noise_sign,
+    void *gpu_logits,
+    size_t output_offset
+) {
+    if (!g_ctx.ready || !g_ctx.headFusedPipeline) return false;
+    EggMetalBatchState *batchState = EggMetalGetBatchState();
+    if (!batchState->inBatch || !batchState->encoder) return false;
+    
+    id<MTLBuffer> bufX = (__bridge id<MTLBuffer>)gpu_x;
+    id<MTLBuffer> bufLogits = (__bridge id<MTLBuffer>)gpu_logits;
+    
+    dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    id<MTLBuffer> bufNoiseA = EggEnsureBuffer(g_ctx.device, &g_ctx.headNoiseABuffer, &g_ctx.headNoiseACapacity, (NSUInteger)VOCAB_SIZE);
+    id<MTLBuffer> bufNoiseB = EggEnsureBuffer(g_ctx.device, &g_ctx.headNoiseBBuffer, &g_ctx.headNoiseBCapacity, (NSUInteger)HIDDEN_DIM);
+    if (!bufNoiseA || !bufNoiseB) { dispatch_semaphore_signal(g_ctx.lock); return false; }
+    memcpy([bufNoiseA contents], noiseA_head, VOCAB_SIZE);
+    memcpy([bufNoiseB contents], noiseB_head, HIDDEN_DIM);
+    if (!g_ctx.headParamsBuffer) {
+        g_ctx.headParamsBuffer = [g_ctx.device newBufferWithLength:sizeof(EggMetalHeadParams)
+                                                           options:MTLResourceStorageModeShared];
+    }
+    EggMetalHeadParams params = { noise_sign, 8, (int32_t)output_offset };
+    memcpy([g_ctx.headParamsBuffer contents], &params, sizeof(EggMetalHeadParams));
+    static id<MTLBuffer> lnBuf = nil;
+    static NSUInteger lnCap = 0;
+    lnBuf = EggEnsureBuffer(g_ctx.device, &lnBuf, &lnCap, (NSUInteger)HIDDEN_DIM);
+    if (!lnBuf) { dispatch_semaphore_signal(g_ctx.lock); return false; }
+    memcpy([lnBuf contents], ln_out, HIDDEN_DIM);
+    dispatch_semaphore_signal(g_ctx.lock);
+    
+    NSUInteger head_off = 0;
+    bool head_in_model = g_ctx.modelBuffer && EggResolveModelWeightOffset(head, &head_off);
+    
+    [batchState->encoder setComputePipelineState:g_ctx.headFusedPipeline];
+    [batchState->encoder setBuffer:bufX offset:0 atIndex:0];
+    if (head_in_model) [batchState->encoder setBuffer:g_ctx.modelBuffer offset:head_off atIndex:1];
+    else [batchState->encoder setBytes:head length:HIDDEN_DIM*VOCAB_SIZE atIndex:1];
+    [batchState->encoder setBuffer:lnBuf offset:0 atIndex:2];
+    [batchState->encoder setBuffer:bufNoiseA offset:0 atIndex:3];
+    [batchState->encoder setBuffer:bufNoiseB offset:0 atIndex:4];
+    [batchState->encoder setBuffer:bufLogits offset:0 atIndex:5];
+    [batchState->encoder setBuffer:g_ctx.headParamsBuffer offset:0 atIndex:6];
+    
+    NSUInteger threadsPerGroup = g_ctx.headFusedPipeline.maxTotalThreadsPerThreadgroup;
+    if (threadsPerGroup < 1) threadsPerGroup = 1;
+    if (threadsPerGroup > 256) threadsPerGroup = 256;
+    MTLSize gridSize = MTLSizeMake((NSUInteger)VOCAB_SIZE, 1, 1);
+    MTLSize tgs = MTLSizeMake(threadsPerGroup, 1, 1);
+    [batchState->encoder dispatchThreads:gridSize threadsPerThreadgroup:tgs];
     return true;
 }
 

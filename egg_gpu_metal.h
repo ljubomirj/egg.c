@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "egg_config.h"
 
 #ifdef __cplusplus
@@ -21,7 +22,8 @@ bool egg_gpu_matmul_perturbed(
     int cols,
     int shift,
     int noise_sign,
-    int32_t xB
+    int32_t xB,
+    size_t output_offset
 );
 
 // GPU matmul that works directly with GPU buffers (no CPU copies)
@@ -37,7 +39,39 @@ bool egg_gpu_matmul_perturbed_gpu(
     int cols,
     int shift,
     int noise_sign,
-    int32_t xB
+    int32_t xB,
+    size_t output_offset
+);
+
+// NEW: GPU matmul that computes xB on GPU - no CPU sync needed!
+// This avoids the need to sync mid-batch to compute xB on CPU
+bool egg_gpu_matmul_noiseb(
+    void *input_gpu,
+    const int8_t *weights,
+    void *output_gpu,
+    const int8_t *noise_a,
+    const int8_t *noise_b,
+    int rows,
+    int cols,
+    int shift,
+    int noise_sign,
+    size_t output_offset
+);
+
+bool egg_gpu_gru_fused(
+    void *gpu_x,
+    void *gpu_h,
+    const int8_t *W0,
+    const int8_t *W1,
+    const int8_t *W2,
+    const int8_t *W3,
+    const int8_t *bias0,
+    const int8_t *bias1,
+    const int8_t *ln_w,
+    const int8_t *noiseA_all,   // 4 * HIDDEN_DIM
+    const int8_t *noiseB_all,   // 4 * HIDDEN_DIM
+    int noise_sign,
+    int shift
 );
 
 bool egg_gpu_update_matrix(
@@ -63,6 +97,7 @@ bool egg_gpu_bind_model_weights(
 void egg_gpu_batch_begin(void);
 void egg_gpu_batch_end(void);  // Commits and waits for all batched operations
 void egg_gpu_batch_flush(void); // Commits current batch but doesn't wait (for async execution)
+void egg_gpu_batch_sync(void);  // Flush current batch, wait, then start new batch (for mid-batch CPU reads)
 
 // GPU-resident buffer management for activations
 // These functions manage GPU buffers that stay on GPU (no CPU-GPU transfers)
@@ -91,6 +126,44 @@ bool egg_gpu_gru_gate(void *gpu_ft, void *gpu_h, void *gpu_out, int count);
 bool egg_gpu_gru_state_update(void *gpu_h, void *gpu_ft, void *gpu_ht, void *gpu_out, int count);
 bool egg_gpu_dot_product(void *gpu_a, void *gpu_b, int32_t *result, int count); // Compute dot product on GPU, result written to *result
 
+bool egg_gpu_gru_fused(
+    void *gpu_x,
+    void *gpu_h,
+    const int8_t *W0,
+    const int8_t *W1,
+    const int8_t *W2,
+    const int8_t *W3,
+    const int8_t *bias0,
+    const int8_t *bias1,
+    const int8_t *ln_w,
+    const int8_t *noiseA_all,   // 4 * HIDDEN_DIM
+    const int8_t *noiseB_all,   // 4 * HIDDEN_DIM
+    int noise_sign,
+    int shift
+);
+
+bool egg_gpu_mlp_fused(
+    void *gpu_x,
+    void *gpu_residual,
+    const int8_t *W_expand,
+    const int8_t *W_project,
+    const int8_t *ln_w,
+    const int8_t *noiseA_all,   // 5 * HIDDEN_DIM (4H expand + H project)
+    const int8_t *noiseB_all,   // 5 * HIDDEN_DIM (H expand + 4H project)
+    int noise_sign
+);
+
+bool egg_gpu_head_fused(
+    void *gpu_x,
+    const int8_t *head,
+    const int8_t *ln_out,
+    const int8_t *noiseA_head,  // VOCAB_SIZE
+    const int8_t *noiseB_head,  // HIDDEN_DIM
+    int noise_sign,
+    void *gpu_logits,
+    size_t output_offset
+);
+
 // Copy data to/from GPU buffers (only when necessary)
 bool egg_gpu_copy_to_buffer(void *gpu_buffer, const void *cpu_data, size_t bytes);
 bool egg_gpu_copy_from_buffer(void *cpu_data, void *gpu_buffer, size_t bytes);
@@ -105,4 +178,3 @@ void* egg_gpu_get_buffer_contents(void *gpu_buffer); // Get pointer to buffer co
 #endif
 
 #endif // EGG_GPU_METAL_H
-
