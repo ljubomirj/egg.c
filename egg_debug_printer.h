@@ -6,6 +6,18 @@
 
 #ifdef EGG_DEBUG
 
+// --- ANSI Colors ---
+#define C_RST  "\033[0m"
+#define C_RED  "\033[31m"
+#define C_GRN  "\033[32m"
+#define C_YEL  "\033[33m"
+#define C_BLU  "\033[34m"
+#define C_MAG  "\033[35m"
+#define C_CYN  "\033[36m"
+#define C_WHT  "\033[37m"
+#define C_GRA  "\033[90m"
+#define C_BOLD "\033[1m"
+
 // --- Activation Statistics ---
 __device__ inline void debug_stat_impl(long step, int t, int l, const char* name, const int8_t* data, int len) {
     // Only print sample steps
@@ -40,9 +52,31 @@ __device__ inline void debug_stat_impl(long step, int t, int l, const char* name
             entropy -= p * log2f(p);
         }
     }
+    
+    // Calculate entropy as % of maximum (log2(256) = 8.0)
+    float max_possible_entropy = 8.0f;
+    float entropy_pct = (entropy / max_possible_entropy) * 100.0f;
 
-    printf("[S%ld L%d T%d] %s: Mean:%.1f Std:%.1f Ent:%.2f Sat:%d%% Zero:%d%% Range:[%d..%d]\n",
-           step, l, t, name, mean, std_dev, entropy, (sat*100)/len, (zero*100)/len, min_v, max_v);
+    // Determine colors
+    int sat_pct = (sat * 100) / len;
+    const char* sat_col = (sat_pct > 10) ? C_RED : (sat_pct > 0) ? C_YEL : C_GRA;
+    
+    int zero_pct = (zero * 100) / len;
+    const char* zero_col = (zero_pct > 50) ? C_BLU : (zero_pct > 10) ? C_CYN : C_GRA;
+    
+    const char* rng_col = (min_v <= -127 || max_v >= 127) ? C_RED : C_GRN;
+
+    printf(C_GRA "[S%5ld L%2d T%3d] " C_WHT "%-14s" C_RST ": "
+           "Mean:" C_BOLD "%5.1f" C_RST " Std:" C_BOLD "%4.1f" C_RST " "
+           "Ent:" C_MAG "%4.2f" C_RST "(" C_MAG "%3.0f%%" C_RST ") "
+           "%sSat:%3d%%%s %sZero:%3d%%%s "
+           "%sRange:[%4d..%4d]" C_RST "\n",
+           step, l, t, name, 
+           mean, std_dev, 
+           entropy, entropy_pct,
+           sat_col, sat_pct, C_RST, 
+           zero_col, zero_pct, C_RST, 
+           rng_col, min_v, max_v);
 }
 
 // --- Attention Statistics ---
@@ -75,14 +109,24 @@ __device__ inline void debug_attn_finish_impl(AttnDebugState* s, long step, int 
     
     // Entropy = log(S) - (Sum(w log w) / S)
     float entropy = 0;
+    float entropy_pct = 0.0f;
+    
     if (s->sum_w > 0) {
         entropy = log2f(s->sum_w) - (s->sum_w_log_w / s->sum_w);
     }
     
+    // Max entropy is log2(N) where N is context length (approx count)
+    if (s->count > 1) {
+        float max_possible = log2f((float)s->count);
+        entropy_pct = (entropy / max_possible) * 100.0f;
+    }
+    
     // Only print Head 0
     if (h == 0) { 
-        printf("[S%ld L%d T%d H%d] Attn: Ent:%.2f MaxW:%d SumW:%.0f Ctx:%d\n",
-               step, l, t, h, entropy, s->max_w, s->sum_w, s->count);
+        printf(C_GRA "[S%5ld L%2d T%3d H%d] " C_YEL "Attn          " C_RST ": "
+               "Ent:" C_MAG "%4.2f" C_RST "(" C_MAG "%3.0f%%" C_RST ") "
+               "MaxW:" C_CYN "%6d" C_RST " SumW:" C_GRN "%8.0f" C_RST " Ctx:" C_BOLD "%4d" C_RST "\n",
+               step, l, t, h, entropy, entropy_pct, s->max_w, s->sum_w, s->count);
     }
 }
 
@@ -91,8 +135,9 @@ __device__ inline void debug_attn_probe_impl(long step, int l, int h, int t, int
     // Inspect Layer 0, Head 0, at Token 10, for the first 10 context positions
     // Reduced frequency to avoid spamming: step % 5 == 0
     if (step % 5 == 0 && l == 0 && h == 0 && t == 10 && ctx < 10) {
-            printf("ATTN_PROBE [S%ld L%d T%d] Ctx%d: Raw:%d Max:%d -> Shifted:%d -> Wt:%d\n", 
-            step, l, t, ctx, sc, max, shifted, wt);
+        printf(C_RED "ATTN_PROBE     " C_GRA "[S%5ld L%2d T%3d] " C_RST 
+               "Ctx%3d: Raw:" C_CYN "%6d" C_RST " Max:" C_CYN "%6d" C_RST " -> Shft:" C_YEL "%6d" C_RST " -> Wt:" C_GRN "%6d" C_RST "\n", 
+               step, l, t, ctx, sc, max, shifted, wt);
     }
 }
 

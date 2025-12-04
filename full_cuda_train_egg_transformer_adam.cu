@@ -32,7 +32,7 @@ void handle_sigint(int sig) {
 // --- CONFIGURATION ---
 #define HIDDEN_DIM 256
 #define HEAD_DIM 64
-#define N_LAYERS 4
+#define N_LAYERS 12
 #define SEQ_LEN 128     
 #define VOCAB_SIZE 256
 #define WARP_SIZE 32
@@ -41,8 +41,8 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 5*2)
-#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 1)
+#define POPULATION_BATCH_SIZE (8192 * 3)
+#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
 
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 3
