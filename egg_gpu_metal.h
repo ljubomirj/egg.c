@@ -43,14 +43,14 @@ bool egg_gpu_matmul_perturbed_gpu(
     size_t output_offset
 );
 
-// NEW: GPU matmul that computes xB on GPU - no CPU sync needed!
-// This avoids the need to sync mid-batch to compute xB on CPU
+// NEW: GPU matmul that computes xB on GPU using hash-based noise - no CPU sync or buffers needed!
+// Uses hash-based noise generation to eliminate CPU-GPU transfers
 bool egg_gpu_matmul_noiseb(
     void *input_gpu,
     const int8_t *weights,
     void *output_gpu,
-    const int8_t *noise_a,
-    const int8_t *noise_b,
+    uint32_t seed_a,
+    uint32_t seed_b,
     int rows,
     int cols,
     int shift,

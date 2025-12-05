@@ -457,10 +457,10 @@ void forward_pass(
         static _Thread_local void *gpu_embedding_buffer = NULL;
         static _Thread_local void *gpu_work_buffers[10] = {NULL}; // Reusable buffers (need more for MLP)
         static _Thread_local void *gpu_mlp_large_buffer = NULL; // For HIDDEN_DIM * 4
-        static _Thread_local void *gpu_noise_buffers[4] = {NULL}; // Reusable noise buffers
+        // Note: gpu_noise_buffers removed - using hash-based noise generation instead!
         static _Thread_local void *gpu_h_state_buffers[N_LAYERS] = {NULL}; // One buffer per layer for h
         static _Thread_local bool buffers_allocated = false;
-        
+
         if (!buffers_allocated) {
             // Allocate reusable GPU buffers once
             gpu_embedding_buffer = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
@@ -468,9 +468,7 @@ void forward_pass(
                 gpu_work_buffers[i] = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
             }
             gpu_mlp_large_buffer = egg_gpu_alloc_temp_buffer(HIDDEN_DIM * 4);
-            for (int i = 0; i < 4; i++) {
-                gpu_noise_buffers[i] = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
-            }
+            // No noise buffer allocations needed - using hash-based generation!
             for (int l = 0; l < N_LAYERS; l++) {
                 gpu_h_state_buffers[l] = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
             }
@@ -478,9 +476,7 @@ void forward_pass(
             for (int i = 0; i < 10; i++) {
                 if (!gpu_work_buffers[i]) buffers_allocated = false;
             }
-            for (int i = 0; i < 4; i++) {
-                if (!gpu_noise_buffers[i]) buffers_allocated = false;
-            }
+            // No noise buffer validation needed!
             for (int l = 0; l < N_LAYERS; l++) {
                 if (!gpu_h_state_buffers[l]) buffers_allocated = false;
             }
@@ -543,24 +539,20 @@ void forward_pass(
                 // Layer norm on GPU
                 egg_gpu_layer_norm(gpu_x, model->ln_weights[l][0], gpu_x, HIDDEN_DIM);
 
-                // Matmuls using new kernel that computes xB on GPU (no sync needed!)
-                int8_t noiseA1[HIDDEN_DIM], noiseB1[HIDDEN_DIM];
-                uint32_t rng1 = l_seed+1;
-                gen_noise_vector(&rng1, noiseA1, HIDDEN_DIM);
-                gen_noise_vector(&rng1, noiseB1, HIDDEN_DIM);
+                // Matmuls using hash-based noise (no arrays, no sync needed!)
+                uint32_t seed1_a = l_seed+1;
+                uint32_t seed1_b = l_seed+1 + 0x10000; // Separate seed for B noise
 
-                // Use new matmul that computes xB on GPU
+                // Use new matmul with hash-based noise
                 egg_gpu_matmul_noiseb(gpu_x, model->gru_weights[l][0], gpu_buf1,
-                                      noiseA1, noiseB1, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, 0);
+                                      seed1_a, seed1_b, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, 0);
 
-                int8_t noiseA2[HIDDEN_DIM], noiseB2[HIDDEN_DIM];
-                uint32_t rng2 = l_seed+2;
-                gen_noise_vector(&rng2, noiseA2, HIDDEN_DIM);
-                gen_noise_vector(&rng2, noiseB2, HIDDEN_DIM);
+                uint32_t seed2_a = l_seed+2;
+                uint32_t seed2_b = l_seed+2 + 0x10000;
 
                 // Use new matmul for h_state too
                 egg_gpu_matmul_noiseb(gpu_h_state[l], model->gru_weights[l][1], gpu_buf2,
-                                      noiseA2, noiseB2, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, 0);
+                                      seed2_a, seed2_b, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, 0);
                 
                 // Element-wise ops on GPU: buf1 + buf2 + bias -> ft
                 void *gpu_bias1 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
@@ -573,22 +565,18 @@ void forward_pass(
                 // GRU gate on GPU: ft * h -> gated_past
                 egg_gpu_gru_gate(gpu_ft, gpu_h_state[l], gpu_gated_past, HIDDEN_DIM);
                 
-                // More matmuls - use new kernel that computes xB on GPU
-                int8_t noiseA3[HIDDEN_DIM], noiseB3[HIDDEN_DIM];
-                uint32_t rng3 = l_seed+3;
-                gen_noise_vector(&rng3, noiseA3, HIDDEN_DIM);
-                gen_noise_vector(&rng3, noiseB3, HIDDEN_DIM);
+                // More matmuls - use hash-based noise
+                uint32_t seed3_a = l_seed+3;
+                uint32_t seed3_b = l_seed+3 + 0x10000;
 
                 egg_gpu_matmul_noiseb(gpu_x, model->gru_weights[l][2], gpu_buf1,
-                                      noiseA3, noiseB3, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, 0);
+                                      seed3_a, seed3_b, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, 0);
 
-                int8_t noiseA4[HIDDEN_DIM], noiseB4[HIDDEN_DIM];
-                uint32_t rng4 = l_seed+4;
-                gen_noise_vector(&rng4, noiseA4, HIDDEN_DIM);
-                gen_noise_vector(&rng4, noiseB4, HIDDEN_DIM);
+                uint32_t seed4_a = l_seed+4;
+                uint32_t seed4_b = l_seed+4 + 0x10000;
 
                 egg_gpu_matmul_noiseb(gpu_gated_past, model->gru_weights[l][3], gpu_buf2,
-                                      noiseA4, noiseB4, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, 0);
+                                      seed4_a, seed4_b, HIDDEN_DIM, HIDDEN_DIM, 8, noise_sign, 0);
                 
                 // buf1 + buf2 + bias -> ht
                 void *gpu_bias2 = egg_gpu_alloc_temp_buffer(HIDDEN_DIM);
@@ -614,23 +602,19 @@ void forward_pass(
                     // Layer norm on GPU
                     egg_gpu_layer_norm(gpu_x, model->ln_weights[l][1], gpu_x, HIDDEN_DIM);
 
-                    // Expand matmul - use new kernel that computes xB on GPU
-                    int8_t noiseA5[HIDDEN_DIM * 4], noiseB5[HIDDEN_DIM];
-                    uint32_t rng5 = l_seed+5;
-                    gen_noise_vector(&rng5, noiseA5, HIDDEN_DIM * 4);
-                    gen_noise_vector(&rng5, noiseB5, HIDDEN_DIM);
+                    // Expand matmul - use hash-based noise
+                    uint32_t seed5_a = l_seed+5;
+                    uint32_t seed5_b = l_seed+5 + 0x10000;
 
                     egg_gpu_matmul_noiseb(gpu_x, model->mlp_weights[l][0], gpu_mlp_large_buffer,
-                                          noiseA5, noiseB5, HIDDEN_DIM * 4, HIDDEN_DIM, 8, noise_sign, 0);
+                                          seed5_a, seed5_b, HIDDEN_DIM * 4, HIDDEN_DIM, 8, noise_sign, 0);
 
-                    // Project matmul - use new kernel
-                    int8_t noiseA6[HIDDEN_DIM], noiseB6[HIDDEN_DIM * 4];
-                    uint32_t rng6 = l_seed+6;
-                    gen_noise_vector(&rng6, noiseA6, HIDDEN_DIM);
-                    gen_noise_vector(&rng6, noiseB6, HIDDEN_DIM * 4);
+                    // Project matmul - use hash-based noise
+                    uint32_t seed6_a = l_seed+6;
+                    uint32_t seed6_b = l_seed+6 + 0x10000;
 
                     egg_gpu_matmul_noiseb(gpu_mlp_large_buffer, model->mlp_weights[l][1], gpu_x,
-                                          noiseA6, noiseB6, HIDDEN_DIM, HIDDEN_DIM * 4, 9, noise_sign, 0);
+                                          seed6_a, seed6_b, HIDDEN_DIM, HIDDEN_DIM * 4, 9, noise_sign, 0);
 
                     // Residual add on GPU
                     egg_gpu_clipped_add(gpu_x, gpu_mlp_residual, gpu_x, HIDDEN_DIM);
@@ -647,14 +631,12 @@ void forward_pass(
                 // Layer norm on GPU (no sync needed - will sync at end)
                 egg_gpu_layer_norm(gpu_x, model->ln_out, gpu_x, HIDDEN_DIM);
 
-                // Head matmul - use new kernel that computes xB on GPU
-                int8_t noiseA_head[VOCAB_SIZE], noiseB_head[HIDDEN_DIM];
-                uint32_t rng_head = step_seed+999;
-                gen_noise_vector(&rng_head, noiseA_head, VOCAB_SIZE);
-                gen_noise_vector(&rng_head, noiseB_head, HIDDEN_DIM);
+                // Head matmul - use hash-based noise
+                uint32_t seed_head_a = step_seed+999;
+                uint32_t seed_head_b = step_seed+999 + 0x10000;
 
                 egg_gpu_matmul_noiseb(gpu_x, model->head, gpu_logits_buffer,
-                                      noiseA_head, noiseB_head, VOCAB_SIZE, HIDDEN_DIM, 8, noise_sign, 0);
+                                      seed_head_a, seed_head_b, VOCAB_SIZE, HIDDEN_DIM, 8, noise_sign, 0);
 
                 // Single sync at end of timestep before reading all results
                 egg_gpu_batch_sync();
