@@ -191,26 +191,12 @@ static NSString *EggMetalShaderSource(void) {
          "#define MAX_VAL %d\n"
          "#define MIN_VAL %d\n"
          "#define HIDDEN_DIM %d\n"
-         "// Hash-based noise generation (eliminates CPU-GPU transfers)\n"
-         "inline uint hash_rng(uint s, uint idx) {\n"
-         "  uint x = s + idx * 0x9e3779b9u;\n"
-         "  x ^= x >> 16; x *= 0x85ebca6b;\n"
-         "  x ^= x >> 13; x *= 0xc2b2ae35;\n"
-         "  x ^= x >> 16;\n"
-         "  return x;\n"
-         "}\n"
-         "inline char noise_from_hash(uint seed, uint idx) {\n"
-         "  uint r = hash_rng(seed, idx);\n"
-         "  return (char)((r & 1 ? 1 : -1) * ((r >> 1) & 31));\n"
-         "}\n"
          "struct EggMetalMatmulParams {\n"
          "  int rows;\n"
          "  int cols;\n"
          "  int shift;\n"
          "  int noise_sign;\n"
          "  int xB;\n"
-         "  uint seed_a;\n"
-         "  uint seed_b;\n"
          "};\n"
          "struct EggMetalUpdateParams {\n"
          "  int rows;\n"
@@ -256,38 +242,27 @@ static NSString *EggMetalShaderSource(void) {
          "  res = max(res, MIN_VAL);\n"
          "  output[gid] = char(res);\n"
          "}\n"
-         "// New kernel with PARALLEL xB computation using hash-based noise!\n"
+         "// New kernel that computes xB internally - no CPU sync needed!\n"
          "kernel void egg_matmul_noiseb_kernel(\n"
          "    device const char *input [[buffer(0)]],\n"
          "    device const char *weights [[buffer(1)]],\n"
          "    device char *output [[buffer(2)]],\n"
-         "    constant EggMetalMatmulParams &params [[buffer(3)]],\n"
+         "    device const char *noiseA [[buffer(3)]],\n"
+         "    device const char *noiseB [[buffer(4)]],\n"
+         "    constant EggMetalMatmulParams &params [[buffer(5)]],\n"
          "    uint gid [[thread_position_in_grid]],\n"
          "    uint tid [[thread_index_in_threadgroup]],\n"
          "    uint tg_size [[threads_per_threadgroup]]) {\n"
-         "  // PARALLEL xB computation: each thread computes partial sum\n"
-         "  threadgroup int shared_partials[256];  // Max threadgroup size\n"
+         "  // Compute xB using thread 0 (simple approach for correctness)\n"
          "  threadgroup int shared_xB;\n"
-         "  \n"
-         "  // Phase 1: Parallel dot product computation\n"
-         "  int partial_sum = 0;\n"
-         "  for (int c = tid; c < params.cols; c += tg_size) {\n"
-         "    partial_sum += int(input[c]) * int(noise_from_hash(params.seed_b, c));\n"
-         "  }\n"
-         "  shared_partials[tid] = partial_sum;\n"
-         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-         "  \n"
-         "  // Phase 2: Tree reduction to sum all partials\n"
-         "  for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {\n"
-         "    if (tid < stride) {\n"
-         "      shared_partials[tid] += shared_partials[tid + stride];\n"
+         "  if (tid == 0) {\n"
+         "    int xB = 0;\n"
+         "    for (int c = 0; c < params.cols; ++c) {\n"
+         "      xB += int(input[c]) * int(noiseB[c]);\n"
          "    }\n"
-         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "    shared_xB = xB;\n"
          "  }\n"
-         "  if (tid == 0) shared_xB = shared_partials[0];\n"
          "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-         "  \n"
-         "  // Phase 3: Matmul with noise perturbation\n"
          "  if (gid >= params.rows) { return; }\n"
          "  const device char *row = weights + gid * params.cols;\n"
          "  int acc = 0;\n"
@@ -295,8 +270,7 @@ static NSString *EggMetalShaderSource(void) {
          "    acc += int(input[c]) * int(row[c]);\n"
          "  }\n"
          "  if (params.noise_sign != 0) {\n"
-         "    int noiseA = int(noise_from_hash(params.seed_a, gid));\n"
-         "    int noise = (shared_xB * noiseA) * params.noise_sign;\n"
+         "    int noise = (shared_xB * int(noiseA[gid])) * params.noise_sign;\n"
          "    acc += (noise >> (FIXED_POINT + SIGMA_SHIFT));\n"
          "  }\n"
          "  int res = acc >> params.shift;\n"
@@ -1419,13 +1393,13 @@ extern "C" bool egg_gpu_matmul_perturbed_gpu(
     return true;
 }
 
-// NEW: GPU matmul with hash-based noise - no CPU sync or buffer allocations needed!
+// NEW: GPU matmul that computes xB on GPU - no CPU sync needed!
 extern "C" bool egg_gpu_matmul_noiseb(
     void *input_gpu,
     const int8_t *weights,
     void *output_gpu,
-    uint32_t seed_a,
-    uint32_t seed_b,
+    const int8_t *noise_a,
+    const int8_t *noise_b,
     int rows,
     int cols,
     int shift,
@@ -1444,6 +1418,15 @@ extern "C" bool egg_gpu_matmul_noiseb(
 
     // Lock for buffer allocation
     dispatch_semaphore_wait(g_ctx.lock, DISPATCH_TIME_FOREVER);
+    NSUInteger outputBytes = (NSUInteger)rows;
+
+    // Allocate noise buffers
+    id<MTLBuffer> noiseABuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.noiseBuffer, &g_ctx.noiseCapacity, outputBytes);
+
+    // NoiseB buffer - need cols bytes
+    static id<MTLBuffer> noiseBBuffer = nil;
+    static NSUInteger noiseBCapacity = 0;
+    noiseBBuffer = EggEnsureBuffer(g_ctx.device, &noiseBBuffer, &noiseBCapacity, (NSUInteger)cols);
 
     id<MTLBuffer> paramsBuffer = g_ctx.paramsBuffer;
     if (!paramsBuffer) {
@@ -1462,33 +1445,25 @@ extern "C" bool egg_gpu_matmul_noiseb(
         weightBuffer = EggEnsureBuffer(g_ctx.device, &g_ctx.weightBuffer, &g_ctx.weightCapacity, weightBytes);
     }
 
-    if (!paramsBuffer || (!useModelBuffer && !weightBuffer)) {
+    if (!noiseABuffer || !noiseBBuffer || !paramsBuffer || (!useModelBuffer && !weightBuffer)) {
         dispatch_semaphore_signal(g_ctx.lock);
         return false;
     }
 
+    // Copy noise data
+    memcpy([noiseABuffer contents], noise_a, outputBytes);
+    memcpy([noiseBBuffer contents], noise_b, (NSUInteger)cols);
     if (!useModelBuffer) {
         memcpy([weightBuffer contents], weights, weightBytes);
     }
 
-    // Pack params with seeds (no noise buffers needed!)
-    struct {
-        int32_t rows;
-        int32_t cols;
-        int32_t shift;
-        int32_t noise_sign;
-        int32_t xB;
-        uint32_t seed_a;
-        uint32_t seed_b;
-    } params;
+    EggMetalMatmulParams params = {};
     params.rows = rows;
     params.cols = cols;
     params.shift = shift;
     params.noise_sign = noise_sign;
     params.xB = 0; // Not used - computed on GPU
-    params.seed_a = seed_a;
-    params.seed_b = seed_b;
-    memcpy([paramsBuffer contents], &params, sizeof(params));
+    memcpy([paramsBuffer contents], &params, sizeof(EggMetalMatmulParams));
 
     dispatch_semaphore_signal(g_ctx.lock);
 
@@ -1518,7 +1493,9 @@ extern "C" bool egg_gpu_matmul_noiseb(
             [encoder setBuffer:weightBuffer offset:0 atIndex:1];
         }
         [encoder setBuffer:outputBuffer offset:output_offset atIndex:2];
-        [encoder setBuffer:paramsBuffer offset:0 atIndex:3];  // Params now at index 3 (no noise buffers!)
+        [encoder setBuffer:noiseABuffer offset:0 atIndex:3];
+        [encoder setBuffer:noiseBBuffer offset:0 atIndex:4];
+        [encoder setBuffer:paramsBuffer offset:0 atIndex:5];
 
         NSUInteger maxThreads = g_ctx.matmulNoisebPipeline.maxTotalThreadsPerThreadgroup;
         if (maxThreads < 1) maxThreads = 1;
