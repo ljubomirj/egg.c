@@ -31,7 +31,7 @@ void handle_sigint(int sig) {
 }
 
 // --- CONFIGURATION ---
-#define HIDDEN_DIM 256
+#define HIDDEN_DIM 512
 #define HEAD_DIM 64
 #define N_LAYERS 4
 #define SEQ_LEN 128     
@@ -42,8 +42,8 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 5 *2)
-#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 3)
+#define POPULATION_BATCH_SIZE (8192 * 7)
+#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 8)
 
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 3
@@ -108,7 +108,7 @@ float get_learning_rate(long step) {
     if (step > 200) {
         return 0.01f;
     }
-    return 0.01f;
+    return 0.1f;
 }
 
 #define ADAM_BETA1 0.9f
