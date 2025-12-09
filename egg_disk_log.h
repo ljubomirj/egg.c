@@ -1,0 +1,200 @@
+#ifndef EGG_DISK_LOG_H
+#define EGG_DISK_LOG_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
+#include <string.h>
+
+#define EGG_API_BASE "https://jlbhiestcyjduotrkmwl.supabase.co/functions/v1"
+#define EGG_PROJECT_ID "f14854a9-9960-4272-b299-7076cf508480"
+
+// Struct to hold logger state
+typedef struct {
+    char filename[256];
+    struct timespec start_ts;
+    char run_id[64];
+    int tracking_enabled;
+} EggLogState;
+
+// Helper to extract value from simple JSON response
+// Finds "id":"value" and copies value to buffer
+static inline void _egg_parse_run_id(const char *json, char *buffer, size_t buf_size) {
+    const char *key = "\"id\":\"";
+    const char *start = strstr(json, key);
+    if (start) {
+        start += strlen(key);
+        const char *end = strchr(start, '"');
+        if (end) {
+            size_t len = end - start;
+            if (len < buf_size) {
+                strncpy(buffer, start, len);
+                buffer[len] = '\0';
+            }
+        }
+    }
+}
+
+// Initialize the logger
+// Opens file, writes header block + CSV header, closes file.
+// Also initializes remote tracking run.
+// Returns initialized state.
+static inline EggLogState egg_log_init(
+    const char *filename,
+    int num_gpus,
+    size_t vram_per_gpu, // In bytes
+    int hidden_dim,
+    int head_dim,
+    int n_layers,
+    int seq_len,
+    int vocab_size,
+    int n_heads,
+    int pop_size,
+    int softmax_scale_bit,
+    int host_gaussian,
+    int device_gaussian,
+    int host_mask,
+    int device_mask
+) {
+    EggLogState state;
+    memset(&state, 0, sizeof(state));
+    strncpy(state.filename, filename, sizeof(state.filename) - 1);
+    state.filename[sizeof(state.filename) - 1] = '\0';
+    
+    // Capture Start Time
+    clock_gettime(CLOCK_MONOTONIC, &state.start_ts);
+    
+    time_t raw_time = time(NULL);
+    struct tm *tm_info = localtime(&raw_time);
+    char start_time_str[64];
+    strftime(start_time_str, sizeof(start_time_str), "%Y-%m-%dT%H:%M:%S", tm_info);
+    
+    // Check file and write header if needed
+    // Using "a" append mode.
+    FILE *f = fopen(filename, "a");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        
+        if (size > 0) fprintf(f, "\n"); // Spacing between runs if appending
+        
+        fprintf(f, "=== Training Run ===\n");
+        fprintf(f, "Run Start:       %s\n", start_time_str);
+        fprintf(f, "Hardware:        %d GPUs, %.2f MB VRAM/GPU\n", num_gpus, (double)vram_per_gpu / (1024.0 * 1024.0));
+        fprintf(f, "Model Config:    Hidden=%d, Head=%d, Layers=%d, SeqLen=%d\n", 
+                hidden_dim, head_dim, n_layers, seq_len);
+        fprintf(f, "                 Vocab=%d, Heads=%d, PopSize=%d, SoftmaxScaleBit=%d\n", 
+                vocab_size, n_heads, pop_size, softmax_scale_bit);
+        fprintf(f, "Noise Config:    HostGaussian=%d, DeviceGaussian=%d, HostMask=%d, DeviceMask=%d\n",
+                host_gaussian, device_gaussian, host_mask, device_mask);
+        fprintf(f, "----------------------------------------------------------------\n");
+        fprintf(f, "Step,RelTime,Loss,Updates,LR\n");
+        
+        fclose(f);
+    } else {
+        perror("Failed to open log file");
+    }
+
+    // --- Tracking Integration (Create Run) ---
+    // Construct simplified name and config
+    char json_body[1024];
+    snprintf(json_body, sizeof(json_body), 
+        "{\"project_id\": \"%s\", \"name\": \"run-%s\", \"config\": {"
+        "\"gpus\": %d, \"hidden\": %d, \"layers\": %d, \"seq_len\": %d, "
+        "\"pop_size\": %d, \"vocab\": %d, \"heads\": %d}}", 
+        EGG_PROJECT_ID, start_time_str,
+        num_gpus, hidden_dim, n_layers, seq_len,
+        pop_size, vocab_size, n_heads
+    );
+
+    // Call Create Run API (Blocking to get ID)
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), 
+        "curl -s -X POST \"%s/runs\" "
+        "-H \"Content-Type: application/json\" "
+        "-d '%s'", 
+        EGG_API_BASE, json_body);
+
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char response[1024];
+        if (fgets(response, sizeof(response), fp) != NULL) {
+            _egg_parse_run_id(response, state.run_id, sizeof(state.run_id));
+            if (strlen(state.run_id) > 0) {
+                state.tracking_enabled = 1;
+                printf("Tracking initialized: Run ID %s\n", state.run_id);
+            }
+        }
+        pclose(fp);
+    } else {
+        // Fallback or error logging if desired, silent for now
+    }
+    
+    return state;
+}
+
+// Record a training step
+// Opens file, writes row, closes file.
+// Also posts metrics to tracking API (detached)
+static inline void egg_log_record(
+    EggLogState *state,
+    long step,
+    double loss,
+    unsigned long long updates,
+    float lr
+) {
+    struct timespec current_ts;
+    clock_gettime(CLOCK_MONOTONIC, &current_ts);
+    
+    double rel_time = ((double)(current_ts.tv_sec - state->start_ts.tv_sec)) + 
+                      ((double)(current_ts.tv_nsec - state->start_ts.tv_nsec) / 1e9);
+                      
+    FILE *f = fopen(state->filename, "a");
+    if (f) {
+        // Write: Step, RelTime, Loss, Updates, LR
+        fprintf(f, "%ld,%.4f,%.4f,%llu,%.6f\n", 
+                step, rel_time, loss, updates, lr);
+        fclose(f);
+    }
+
+    // --- Tracking Integration (Log Metrics) ---
+    if (state->tracking_enabled) {
+        char json_body[512];
+        // Matches Python: "metrics": [{"name": "loss", "value": loss, "step": step}, ...]
+        snprintf(json_body, sizeof(json_body), 
+            "{\"metrics\": ["
+            "{\"name\": \"loss\", \"value\": %.4f, \"step\": %ld}, "
+            "{\"name\": \"updates\", \"value\": %llu, \"step\": %ld}, "
+            "{\"name\": \"lr\", \"value\": %.6f, \"step\": %ld}]}", 
+            loss, step, updates, step, lr, step);
+
+        char cmd[1024];
+        // Use background execution (&) and silence output
+        snprintf(cmd, sizeof(cmd), 
+            "curl -s -X POST \"%s/runs/%s/metrics\" "
+            "-H \"Content-Type: application/json\" "
+            "-d '%s' > /dev/null 2>&1 &", 
+            EGG_API_BASE, state->run_id, json_body);
+
+        system(cmd);
+    }
+}
+
+static inline void egg_log_close(EggLogState *state) {
+    // --- Tracking Integration (Mark Completed) ---
+    if (state->tracking_enabled) {
+        // Blocking call to ensure it finishes before exit
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), 
+            "curl -s -X PATCH \"%s/runs/%s\" "
+            "-H \"Content-Type: application/json\" "
+            "-d '{\"status\": \"completed\"}' > /dev/null 2>&1", 
+            EGG_API_BASE, state->run_id);
+        
+        system(cmd);
+        printf("Tracking completed for Run ID %s\n", state->run_id);
+    }
+}
+
+#endif // EGG_DISK_LOG_H
