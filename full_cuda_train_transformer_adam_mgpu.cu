@@ -43,7 +43,7 @@ void handle_sigint(int sig) {
 #define BLOCK_THREADS (ALIGNED_DIM > MAX_BLOCK_THREADS ? MAX_BLOCK_THREADS : ALIGNED_DIM)
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
-#define POPULATION_BATCH_SIZE (8192 * 5 * 2)
+#define POPULATION_BATCH_SIZE (8192 * 5)
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
 
 #define FIXED_POINT 4
@@ -124,7 +124,7 @@ void handle_sigint(int sig) {
 #define SHIFT_MLP_DOWN 10
 
 // Generator settings
-#define HOST_GAUSSIAN true
+#define HOST_GAUSSIAN false
 #define DEVICE_GAUSSIAN false
 #define HOST_MASK 15
 #define DEVICE_MASK 15
@@ -156,6 +156,13 @@ float get_learning_rate(long step) {
 #define ADAM_BETA2 0.98f
 #define ADAM_EPS 1e-8f
 #define ADAM_WEIGHT_DECAY 0.01f
+
+#define USE_MUON // Unwrap to enable Muon Optimizer
+
+#ifdef USE_MUON
+    #define MUON_MOMENTUM 0.85f
+    #define MUON_LR_SCALE 1.0f
+#endif
 
 #define CHECK_CUDA(call) { cudaError_t err = call; if (err != cudaSuccess) { printf("CUDA Error: %s:%d\n", cudaGetErrorString(err), __LINE__); exit(1); } }
 #define CHECK_CUBLAS(call) { cublasStatus_t err = call; if (err != CUBLAS_STATUS_SUCCESS) { printf("CUBLAS Error: %d at %s:%d\n", (int)err, __FILE__, __LINE__); exit(1); } }
@@ -203,8 +210,6 @@ typedef struct {
     float v;
     float acc; // Fractional accumulator for integer weights
 } AdamParam;
-
-#define USE_MUON // Unwrap to enable Muon Optimizer
 
 #ifdef USE_MUON
 typedef struct {
@@ -1154,10 +1159,50 @@ int main() {
     size_t vram_per_gpu = sizeof(TransformerModel) + sizeof(AdamModel) + ds.length + 
                           POPULATION_SIZE*sizeof(int32_t) + (POPULATION_SIZE/2)*sizeof(int32_t) + kv_size;
     
-    EggLogState log_state = egg_log_init("models/training_log.csv", num_devices, vram_per_gpu,
-                                         HIDDEN_DIM, HEAD_DIM, N_LAYERS, SEQ_LEN, VOCAB_SIZE, N_HEADS, 
-                                         POPULATION_SIZE, SOFTMAX_SCALE_BIT,
-                                         HOST_GAUSSIAN, DEVICE_GAUSSIAN, HOST_MASK, DEVICE_MASK);
+    EggLogConfig log_cfg;
+    memset(&log_cfg, 0, sizeof(log_cfg));
+    log_cfg.num_gpus = num_devices;
+    log_cfg.vram_per_gpu = vram_per_gpu;
+    log_cfg.hidden_dim = HIDDEN_DIM;
+    log_cfg.head_dim = HEAD_DIM;
+    log_cfg.n_layers = N_LAYERS;
+    log_cfg.seq_len = SEQ_LEN;
+    log_cfg.vocab_size = VOCAB_SIZE;
+    log_cfg.n_heads = N_HEADS;
+    log_cfg.pop_size = POPULATION_SIZE;
+    log_cfg.softmax_scale_bit = SOFTMAX_SCALE_BIT;
+    log_cfg.host_gaussian = HOST_GAUSSIAN;
+    log_cfg.device_gaussian = DEVICE_GAUSSIAN;
+    log_cfg.host_mask = HOST_MASK;
+    log_cfg.device_mask = DEVICE_MASK;
+    
+    log_cfg.fixed_point = FIXED_POINT;
+    log_cfg.sigma_shift = SIGMA_SHIFT;
+    log_cfg.sigma_shift_vector = SIGMA_SHIFT_VECTOR;
+    
+    log_cfg.shift_attn = SHIFT_ATTN;
+    log_cfg.shift_qkv = SHIFT_QKV;
+    log_cfg.shift_out = SHIFT_OUT;
+    log_cfg.shift_logit = SHIFT_LOGIT;
+    log_cfg.shift_mlp_up = SHIFT_MLP_UP;
+    log_cfg.shift_mlp_down = SHIFT_MLP_DOWN;
+    
+    log_cfg.softmax_exp_scale = SOFTMAX_EXP_SCALE;
+    
+    log_cfg.adam_beta1 = ADAM_BETA1;
+    log_cfg.adam_beta2 = ADAM_BETA2;
+    log_cfg.adam_eps = ADAM_EPS;
+    log_cfg.adam_weight_decay = ADAM_WEIGHT_DECAY;
+    
+#ifdef USE_MUON
+    log_cfg.use_muon = 1;
+    log_cfg.muon_momentum = MUON_MOMENTUM;
+    log_cfg.muon_lr_scale = MUON_LR_SCALE;
+#else
+    log_cfg.use_muon = 0;
+#endif
+
+    EggLogState log_state = egg_log_init("models/training_log.csv", log_cfg);
 
     for(int i=0; i<num_devices; i++) {
         CHECK_CUDA(cudaSetDevice(i));
@@ -1195,6 +1240,7 @@ int main() {
         CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_buf1, max_mx_elems * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_buf2, gram_elems * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_buf3, gram_elems * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&ctx.muon_ws.d_buf_swap, max_mx_elems * sizeof(float)));
 #endif
 
         gpus.push_back(ctx);
@@ -1254,6 +1300,11 @@ int main() {
         for(int i=0; i<num_devices; i++) {
              CHECK_CUDA(cudaSetDevice(gpus[i].id));
              CHECK_CUDA(cudaStreamSynchronize(gpus[i].stream));
+             cudaError_t err = cudaGetLastError();
+             if (err != cudaSuccess) {
+                 printf("ERROR after evaluation GPU %d: %s\n", i, cudaGetErrorString(err));
+                 exit(1);
+             }
         }
         
         // 2. Host Fitness Calculation
@@ -1264,7 +1315,11 @@ int main() {
         
         // Queue Updates
         for(int i=0; i<num_devices; i++) {
+            printf("running step %d on GPU %d\n", step, i);
             CHECK_CUDA(cudaSetDevice(gpus[i].id));
+            
+            // Explicit Sync to catch errors before Memcpy
+            CHECK_CUDA(cudaDeviceSynchronize()); 
             
             // Broadcast fitness
             CHECK_CUDA(cudaMemcpyAsync(gpus[i].d_fit, h_fit, (POPULATION_SIZE/2) * sizeof(int32_t), cudaMemcpyHostToDevice, gpus[i].stream));
@@ -1279,20 +1334,18 @@ int main() {
         BASE, gpus[i].d_fit, seed, current_lr * LR_SCALE)
 
 #ifdef USE_MUON
-    #define MUON_MOMENTUM 0.85f
     // Muon update O has norm 1. Adam update g/sqrt(v) has magnitude ~1.
     // We scale Muon by a factor to match expected update magnitude for int8 weights.
     // heuristic: sqrt(HIDDEN_DIM) or similar might be needed, but start with 1.0 * LR
-    #define MUON_LR_SCALE 1.0f
 
     #define LAUNCH_ADAM_MATRIX(M_PTR, OPT_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
         do { \
              muon_momentum_update_kernel<<< (ROWS*COLS+511)/512, 512, 0, gpus[i].stream >>>( \
                 (MuonParam*)OPT_PTR, ROWS, COLS, SEED_A, SEED_B, BASE, gpus[i].d_fit, seed, MUON_MOMENTUM); \
-             muon_gather_m_kernel<<< (ROWS*COLS+511)/512, 512, 0, gpus[i].stream >>>((MuonParam*)OPT_PTR, gpus[i].muon_ws.d_buf1, ROWS*COLS); \
+             muon_gather_m_kernel<<< (ROWS*COLS+511)/512, 512, 0, gpus[i].stream >>>((MuonParam*)OPT_PTR, gpus[i].muon_ws.d_buf1, ROWS, COLS); \
              perform_newton_schulz(gpus[i].cublas_handle, gpus[i].muon_ws, gpus[i].muon_ws.d_buf1, ROWS, COLS, gpus[i].stream); \
              muon_apply_update_kernel<<< (ROWS*COLS+511)/512, 512, 0, gpus[i].stream >>>( \
-                (WeightType*)M_PTR, (MuonParam*)OPT_PTR, gpus[i].muon_ws.d_buf1, ROWS*COLS, current_lr * MUON_LR_SCALE, ADAM_WEIGHT_DECAY); \
+                (WeightType*)M_PTR, (MuonParam*)OPT_PTR, gpus[i].muon_ws.d_buf1, ROWS, COLS, current_lr * MUON_LR_SCALE, ADAM_WEIGHT_DECAY); \
         } while(0)
 #else
     #define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
@@ -1334,7 +1387,14 @@ int main() {
             LAUNCH_ADAM_VECTOR(gpus[i].d_model->mlp_emb_bias_down, gpus[i].d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B, 0, 1.0f);
 
             LAUNCH_ADAM_VECTOR(gpus[i].d_model->emb_bias, gpus[i].d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS_A, SEED_OFF_EMB_BIAS_B, 0, 0.1f);
-            LAUNCH_ADAM_MATRIX(gpus[i].d_model->embedding, gpus[i].d_adam_state->embedding, HIDDEN_DIM, VOCAB_SIZE, SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 0);
+            // Explicitly use Adam kernel for embedding (never Muon) to match AdamParam struct type
+            update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512, 0, gpus[i].stream >>>(
+                (WeightType*)gpus[i].d_model->embedding, 
+                (AdamParam*)gpus[i].d_adam_state->embedding, 
+                HIDDEN_DIM, VOCAB_SIZE, 
+                SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 
+                0, gpus[i].d_fit, seed, current_lr
+            );
             
     #undef LAUNCH_ADAM_MATRIX
     #undef LAUNCH_ADAM_VECTOR
@@ -1413,6 +1473,7 @@ int main() {
         cudaFree(ctx.muon_ws.d_buf1);
         cudaFree(ctx.muon_ws.d_buf2);
         cudaFree(ctx.muon_ws.d_buf3);
+        cudaFree(ctx.muon_ws.d_buf_swap);
 #endif
         cudaStreamDestroy(ctx.stream);
     }

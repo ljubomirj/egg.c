@@ -1,6 +1,8 @@
 #ifndef MUON_INTERNAL_CUH
 #define MUON_INTERNAL_CUH
 
+#ifdef USE_MUON
+
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <stdio.h>
@@ -46,15 +48,27 @@ __global__ void muon_momentum_update_kernel(
 }
 
 // 2. Gather Kernel
-// Copies the 'm' field from AoS MuonParam to contiguous SoA float buffer
+// Copies 'm' from "Blocked" MuonParam layout to "Row-Major" float buffer
+// Buffer must be Row-Major for cuBLAS
 __global__ void muon_gather_m_kernel(
     const MuonParam *muon_state,
     float *buffer,
-    int size
+    int rows, int cols
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int size = rows * cols;
     if (idx < size) {
-        buffer[idx] = muon_state[idx].m;
+        // Decode Blocked Layout
+        int byte_off = idx & 3;
+        int word_idx = idx >> 2;
+        int tid = word_idx % cols; // Col
+        int k_chunk = word_idx / cols; 
+        int k = k_chunk * 4 + byte_off; // Row
+        
+        // Write to Standard Row-Major (k * cols + tid)
+        if (k < rows && tid < cols) {
+             buffer[k * cols + tid] = muon_state[idx].m;
+        }
     }
 }
 
@@ -82,12 +96,12 @@ __global__ void muon_newton_schulz_term_kernel(
 }
 
 // 4. Apply Update Kernel (Optimization Step 2)
-// Takes orthogonalized updates from buffer, applies to weights.
+// Takes orthogonalized updates from Row-Major buffer, applies to Blocked weights.
 __global__ void muon_apply_update_kernel(
     WeightType *W,
     MuonParam *muon_state,
     const float *update_buffer,
-    int size,
+    int rows, int cols,
     float learning_rate,
     float weight_decay
 ) {
@@ -98,10 +112,23 @@ __global__ void muon_apply_update_kernel(
     __syncthreads();
 
     int change = 0;
+    int size = rows * cols;
     if (idx < size) {
+        // Decode Blocked Layout to find coordinate
+        int byte_off = idx & 3;
+        int word_idx = idx >> 2;
+        int tid = word_idx % cols; // Col
+        int k_chunk = word_idx / cols; 
+        int k = k_chunk * 4 + byte_off; // Row
+
         WeightType w = W[idx];
         MuonParam p = muon_state[idx];
-        float u = update_buffer[idx];
+        
+        // Read update from Row-Major Buffer
+        float u = 0.0f;
+        if (k < rows && tid < cols) {
+            u = update_buffer[k * cols + tid];
+        }
 
         // Muon Update: W -= lr * (O + wd * W)
         // We define 'step' as what we ADD to W.
@@ -136,6 +163,7 @@ struct MuonWorkspace {
     float *d_buf1; // Size M*N
     float *d_buf2; // Size K*K (Gram)
     float *d_buf3; // Size K*K (Temp)
+    float *d_buf_swap; // Size M*N (Temp for aliasing avoidance)
     size_t allocated_size_1;
     size_t allocated_size_2;
 };
@@ -242,28 +270,17 @@ void perform_newton_schulz(
         
         // G = X * X^T or X^T * X
         alpha = 1.0f; beta = 0.0f;
+        // LDA and LDB must both vary based on use_rows:
+        // - When use_rows=true (rows < cols): LDA=L, LDB=L (both use col dimension)
+        // - When use_rows=false (rows > cols): LDA=K, LDB=K (both use col dimension)
+        // The leading dimension is always the number of columns in row-major = rows in col-major view
+        int ld = use_rows ? L : K;
+        
         cublasSgemm(handle, opA, opB, 
             m_gemm, n_gemm, k_gemm,
             &alpha, 
-            d_X, use_rows ? L : K, // Leading dim of input. If Trans(Mc): LDA=L? No.
-            // If opA=T (use_rows), Input is Mc (L x K). op(Input) is K x L. LDA=L. Correct.
-            // If opA=N (!use_rows), Input is Mc (K x L). op(Input) is K x L. LDA=K. Correct.
-            // Leading dimension in cuBLAS is always number of rows in stored storage (Stride).
-            // Mc is (L x K) if use_rows? No.
-            // d_X is Row-Major (Rows x Cols).
-            // cuBLAS Mc is (Cols x Rows).
-            // use_rows=True (Rows=768 < Cols=3072).
-            // Mc is (3072 x 768).
-            // m_gemm=768, n_gemm=768, k_gemm=3072.
-            // OpA=T -> A^T * B.
-            // A=Mc. A^T is (768 x 3072).
-            // B=Mc (No op). B is (3072 x 768).
-            // Result (768 x 768).
-            // LDA of A (Mc): 3072.
-            // LDB of B (Mc): 3072.
-            // LDC of Res: 768.
-            
-            d_X, L,  // B
+            d_X, ld,  // A with LDA
+            d_X, ld,  // B with LDB (same buffer, same layout)
             &beta,
             ws.d_buf2, K // Result G
         );
@@ -307,7 +324,7 @@ void perform_newton_schulz(
                  d_X, L,
                  ws.d_buf3, K, // B
                  &beta,
-                 ws.d_buf1, L // Out Temp
+                 ws.d_buf_swap, L // Out Temp (Use Swap to avoid aliasing d_X)
              );
         } else {
              // B * Mc
@@ -318,13 +335,15 @@ void perform_newton_schulz(
                  ws.d_buf3, K, // B
                  d_X, K,
                  &beta,
-                 ws.d_buf1, K // Out Temp
+                 ws.d_buf_swap, K // Out Temp (Use Swap to avoid aliasing d_X)
              );
         }
-        
+
         // Copy back to X
-        cudaMemcpyAsync(d_X, ws.d_buf1, rows*cols*sizeof(float), cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(d_X, ws.d_buf_swap, rows*cols*sizeof(float), cudaMemcpyDeviceToDevice, stream);
     }
 }
+
+#endif // USE_MUON
 
 #endif // MUON_INTERNAL_CUH
