@@ -334,9 +334,9 @@ main() {
     # Test without Muon (pure Adam)
     run_if_assigned "no_muon" "-DUSE_MUON=0"
     
-    # Muon momentum variations (only if Muon enabled by default)
-    run_if_assigned "muon_momentum_0.8" "-DMUON_MOMENTUM=0.8f"
-    run_if_assigned "muon_momentum_0.9" "-DMUON_MOMENTUM=0.9f"
+    # Muon momentum variations
+    run_if_assigned "muon_momentum_0.8" "-DUSE_MUON=1 -DMUON_MOMENTUM=0.8f"
+    run_if_assigned "muon_momentum_0.9" "-DUSE_MUON=1 -DMUON_MOMENTUM=0.9f"
     
     # ============================================
     # NOISE PARAMETERS (experiments 15-20)

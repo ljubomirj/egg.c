@@ -1,7 +1,7 @@
 #ifndef MUON_INTERNAL_CUH
 #define MUON_INTERNAL_CUH
 
-#ifdef USE_MUON
+#if USE_MUON == 1
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>

@@ -39,10 +39,10 @@ void handle_sigint(int sig) {
 #  define HEAD_DIM 64
 #endif
 #ifndef N_LAYERS
-#  define N_LAYERS 8
+#  define N_LAYERS 4
 #endif
 #ifndef SEQ_LEN
-#  define SEQ_LEN 256
+#  define SEQ_LEN 32
 #endif
 
 #include "egg_ntt.cuh"
@@ -54,6 +54,17 @@ void handle_sigint(int sig) {
 #ifndef VOCAB_SIZE
 #  define VOCAB_SIZE 256
 #endif
+
+#if VOCAB_SIZE != 256
+#  define USE_TOKENIZER 1
+#endif
+
+#ifdef USE_TOKENIZER
+using TokenType = uint32_t;
+#else
+using TokenType = uint8_t;
+#endif
+
 #ifndef WARP_SIZE
 #  define WARP_SIZE 32
 #endif
@@ -65,7 +76,7 @@ void handle_sigint(int sig) {
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 #ifndef POPULATION_BATCH_SIZE
-#  define POPULATION_BATCH_SIZE (8192 * 1)
+#   define POPULATION_BATCH_SIZE (8192 * 2)
 #endif
 #define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
 
@@ -73,10 +84,10 @@ void handle_sigint(int sig) {
 #  define FIXED_POINT 4
 #endif
 #ifndef SIGMA_SHIFT
-#  define SIGMA_SHIFT 4
+#  define SIGMA_SHIFT 3
 #endif
 #ifndef SIGMA_SHIFT_VECTOR
-#  define SIGMA_SHIFT_VECTOR 3
+#  define SIGMA_SHIFT_VECTOR 4
 #endif
 #define MAX_VAL 127
 #define MIN_VAL -127
@@ -89,12 +100,12 @@ void handle_sigint(int sig) {
 #  define SOFTMAX_LUT_SIZE 256
 #endif
 #ifndef SOFTMAX_EXP_SCALE
-#  define SOFTMAX_EXP_SCALE 8.0
+#  define SOFTMAX_EXP_SCALE 6.0
 #endif
 
 // RoPE Configuration
 #ifndef ROPE_SCALE_BIT
-#  define ROPE_SCALE_BIT 30
+#  define ROPE_SCALE_BIT 20
 #endif
 #define ROPE_SCALE (1 << ROPE_SCALE_BIT)
 #define ROPE_LUT_SIZE (SEQ_LEN * (HEAD_DIM / 2) * 2)
@@ -191,8 +202,16 @@ void handle_sigint(int sig) {
 #  define DEVICE_MASK 15
 #endif
 
+// TOPOLOGY THEORY MODE
+// If 1, each GPU is initialized with a different seed (different weights).
+// The training loop ignores this difference, applying identical updates to divergent models.
+#ifndef TOPOLOGY_DIVERGENCE
+#  define TOPOLOGY_DIVERGENCE 0
+#endif
+
 // ADAM HYPERPARAMS
 float get_learning_rate(long step) {
+    return 0.3f;
     if (step < 100) {
         return 1.0f;
     }
@@ -218,7 +237,7 @@ float get_learning_rate(long step) {
 #  define ADAM_BETA1 0.9f
 #endif
 #ifndef ADAM_BETA2
-#  define ADAM_BETA2 0.98f
+#  define ADAM_BETA2 0.95f
 #endif
 #ifndef ADAM_EPS
 #  define ADAM_EPS 1e-8f
@@ -250,7 +269,7 @@ using AccumType     = int32_t;   // 32-bit sufficient for ~6M max sum
 using AttnAccumType = long long; // Need high precision for attention weighted sum
 using VoteType      = int32_t;
 
-typedef struct { uint8_t *data; long length; } Dataset;
+typedef struct { void *data; long length; } Dataset;
 
 typedef struct {
     WeightType embedding[VOCAB_SIZE * HIDDEN_DIM];
@@ -295,7 +314,7 @@ typedef struct {
     float acc; // Fractional accumulator for integer weights
 } AdamParam;
 
-#ifdef USE_MUON
+#if USE_MUON == 1
 typedef struct {
     float m;
     float acc;
@@ -429,8 +448,8 @@ void repack_matrix(int8_t *dst, int8_t *src, int rows, int cols) {
     }
 }
 
-void init_model(TransformerModel *model) {
-    uint32_t rng = 42;
+void init_model(TransformerModel *model, uint32_t seed) {
+    uint32_t rng = seed;
     TransformerModel *temp = (TransformerModel*)calloc(1, sizeof(TransformerModel));
     if(!temp) exit(1);
     
@@ -816,7 +835,7 @@ __device__ void compute_transformer_layer(
 }
 
 __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
-    const uint8_t * __restrict__ dataset, long data_len, int start_idx,
+    const TokenType * __restrict__ dataset, long data_len, int start_idx,
     const TransformerModel * __restrict__ model,
     ActType * __restrict__ global_kv_cache,
     int32_t *accum_loss, uint32_t step_seed,
@@ -857,12 +876,16 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         
         if (step%5 == 0 && global_pop_offset == 0 && blockIdx.x == 0 && tid == 0 && t == 0) {
              printf("DEBUG: Dataset[0..10] at stream_pos=%ld: ", stream_pos);
+#ifdef USE_TOKENIZER
+             for(int i=0; i<10 && stream_pos+i < data_len; i++) printf("%u ", dataset[stream_pos+i]);
+#else
              for(int i=0; i<10 && stream_pos+i < data_len; i++) printf("%d(%c) ", dataset[stream_pos+i], (dataset[stream_pos+i]>=32 && dataset[stream_pos+i]<=126) ? dataset[stream_pos+i] : '.');
+#endif
              printf("\n");
         }
 
         // 1. Embedding
-        uint8_t input_token = dataset[stream_pos + t];
+        TokenType input_token = dataset[stream_pos + t];
         uint32_t seed_emb = (step_seed + pair_idx) + SEED_OFF_EMB;
         WeightType emb = get_embedding_byte(model->embedding, tid, input_token);
         WeightType ebias = model->emb_bias[tid];
@@ -927,58 +950,63 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         
         AccumType sbh = block_reduce_sum_broadcast((AccumType)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_EMB + HIDDEN_DIM, tid), temp_storage, shared_scalar);
 
-        int32_t *s_logits = (int32_t*)&s_mem[2*HIDDEN_DIM];
-        __shared__ int32_t s_logit_max;
+        // --- Two-Pass Softmax (Loop-based for Large Vocab) ---
         
-        if(tid < VOCAB_SIZE) {
-            const int32_t *wh_p = (const int32_t*)model->embedding;
-            int32_t *v_ptr_h = (int32_t*)s_norm;
-            
-            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, tid, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns);
-            
-            int32_t lgt = ah >> SHIFT_LOGIT;  // Keep as int32 for max comparison
-            s_logits[tid] = lgt;
+        // Pass 1: Find Max Logit
+        int32_t local_max = INT_MIN;
+        const int32_t *wh_p = (const int32_t*)model->embedding;
+        int32_t *v_ptr_h = (int32_t*)s_norm;
+        
+        for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
+            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns);
+            int32_t lgt = ah >> SHIFT_LOGIT;
+            if (lgt > local_max) local_max = lgt;
         }
-        __syncthreads();
         
-        // Find max logit using atomicMax (thread 0 initializes, all threads update)
-        if (tid == 0) s_logit_max = INT_MIN;
+        // Reduce max across threads
+        int32_t global_max = BlockReduce(temp_storage).Reduce(local_max, cub::Max());
+        __shared__ int32_t s_global_max;
+        if (tid == 0) s_global_max = global_max;
         __syncthreads();
-        if (tid < VOCAB_SIZE) atomicMax(&s_logit_max, s_logits[tid]);
-        __syncthreads();
+        global_max = s_global_max;
 
+        // Pass 2: Sum Exp and Find Target Logit
+        int64_t local_sum_ex = 0;
         __shared__ int32_t s_target_logit;
-        int32_t my_ex = 0;
+        if (tid == 0) s_target_logit = 0;
+        __syncthreads();
 
-        // Compute exp locally and identify target logit
-        if(tid < VOCAB_SIZE) {
-             int32_t lgt = s_logits[tid];
-             int32_t shifted = lgt - s_logit_max;
-             my_ex = softmax_exp_lookup(shifted);
-
-             uint8_t target_token = dataset[stream_pos + t + 1];
-             if (tid == (int)target_token) s_target_logit = lgt;
+        TokenType target_token = dataset[stream_pos + t + 1];
+        
+        for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
+            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns);
+            int32_t lgt = ah >> SHIFT_LOGIT;
+            
+            int32_t shifted = lgt - global_max;
+            local_sum_ex += softmax_exp_lookup(shifted);
+            
+            if (v == (int)target_token) s_target_logit = lgt;
         }
         __syncthreads();
         
-        // Sum exponentials using BlockReduce
-        AccumType sum_ex = BlockReduce(temp_storage).Sum(my_ex);
+        // Reduce sum across threads (using 64-bit reduction)
+        typedef cub::BlockReduce<long long, BLOCK_THREADS> BlockReduce64;
+        __shared__ typename BlockReduce64::TempStorage temp_storage64;
+        long long global_sum_ex = BlockReduce64(temp_storage64).Sum(local_sum_ex);
 
         // Loss Calc (Thread 0)
         if (tid == 0) {
             int64_t log_sum = 0;
-            if (sum_ex > 0) {
-                uint64_t x = (uint64_t)sum_ex; int pos = 0;
+            if (global_sum_ex > 0) {
+                uint64_t x = (uint64_t)global_sum_ex; int pos = 0;
                 while(x >= 256) { x >>= 8; pos += 8; }
                 if(x >= 16) { x >>= 4; pos += 4; }
                 if(x >= 4) { x >>= 2; pos += 2; }
                 if(x >= 2) { pos += 1; }
                 
-                // Scale factor: log2(2^20) = 20, so subtract 20 from pos for proper scaling
                 log_sum = (pos << 4) - (SOFTMAX_SCALE_BIT << 4);
             }
-            // Loss = log(sum_ex) + max_logit - target_logit
-            my_loss += (log_sum >> 1) + s_logit_max - s_target_logit;
+            my_loss += (log_sum >> 1) + global_max - s_target_logit;
         }
         __syncthreads(); 
     }
@@ -1110,7 +1138,7 @@ __global__ void update_vector_adam_kernel(
 }
 
 __global__ void generate_sequence_kernel(
-    uint8_t * buffer, int seed_len, int gen_len,
+    TokenType * buffer, int seed_len, int gen_len,
     const TransformerModel * __restrict__ model,
     ActType * __restrict__ kv_cache,
     uint32_t seed
@@ -1123,7 +1151,6 @@ __global__ void generate_sequence_kernel(
     ActType *s_x = s_mem; 
     __shared__ typename BlockReduce::TempStorage temp_storage;
     __shared__ AccumType shared_scalar;
-    __shared__ int32_t shared_logits[VOCAB_SIZE];
 
     int total_len = seed_len + gen_len;
     size_t kv_layer_stride = 2ULL * total_len * HIDDEN_DIM;
@@ -1131,7 +1158,7 @@ __global__ void generate_sequence_kernel(
     for (int t = 0; t < total_len - 1; t++) { 
         __syncthreads(); 
 
-        uint8_t input_token = buffer[t];
+        TokenType input_token = buffer[t];
         
         // 1. Embedding
         WeightType emb = get_embedding_byte(model->embedding, tid, input_token);
@@ -1167,43 +1194,74 @@ __global__ void generate_sequence_kernel(
         ActType *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
 
-        __shared__ int32_t s_gen_max;
+        // --- Three-Pass Sampling (Loop-based) ---
+        
+        // Pass 1: Find Max Logit
+        int32_t local_max = INT_MIN;
+        const int32_t *wh_p = (const int32_t*)model->embedding;
+        int32_t *v_ptr_h = (int32_t*)s_norm;
+        
+        for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
+            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
+            int32_t lgt = ah >> SHIFT_LOGIT;
+            if (lgt > local_max) local_max = lgt;
+        }
+        
+        int32_t global_max = BlockReduce(temp_storage).Reduce(local_max, cub::Max());
+        __shared__ int32_t s_global_max;
+        if (tid == 0) s_global_max = global_max;
+        __syncthreads();
+        global_max = s_global_max;
 
-        if(tid < VOCAB_SIZE) {
-            const int32_t *wh_p = (const int32_t*)model->embedding;
-            int32_t *v_ptr_h = (int32_t*)s_norm;
-            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, tid, 0, 0, 0);
-            shared_logits[tid] = ah >> SHIFT_LOGIT;
+        // Pass 2: Sum Exp
+        int64_t local_sum_ex = 0;
+        for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
+            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
+            int32_t lgt = ah >> SHIFT_LOGIT;
+            int32_t shifted = lgt - global_max;
+            local_sum_ex += softmax_exp_lookup(shifted);
+        }
+        
+        typedef cub::BlockReduce<long long, BLOCK_THREADS> BlockReduce64;
+        __shared__ typename BlockReduce64::TempStorage temp_storage64;
+        long long global_sum_ex = BlockReduce64(temp_storage64).Sum(local_sum_ex);
+        
+        __shared__ long long s_thresh;
+        __shared__ int s_selected;
+        if (tid == 0) {
+            uint32_t s = seed + t * 555;
+            uint32_t r = hash_rng(s, 0);
+            s_thresh = (global_sum_ex > 0) ? (r % global_sum_ex) : 0;
+            s_selected = 0; 
         }
         __syncthreads();
 
-        if (tid == 0) s_gen_max = INT_MIN;
-        __syncthreads();
-        if (tid < VOCAB_SIZE) atomicMax(&s_gen_max, shared_logits[tid]);
-        __syncthreads();
-
-        if(tid < VOCAB_SIZE) {
-            int32_t shifted = shared_logits[tid] - s_gen_max;
-            shared_logits[tid] = softmax_exp_lookup(shifted);
+        // Pass 3: Select using BlockScan
+        typedef cub::BlockScan<long long, BLOCK_THREADS> BlockScan64;
+        __shared__ typename BlockScan64::TempStorage scan_storage;
+        long long thread_prefix_sum;
+        BlockScan64(scan_storage).ExclusiveSum(local_sum_ex, thread_prefix_sum);
+        
+        if (s_thresh >= thread_prefix_sum && s_thresh < thread_prefix_sum + local_sum_ex) {
+            long long running = thread_prefix_sum;
+            for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
+                AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, 0, 0, 0);
+                int32_t lgt = ah >> SHIFT_LOGIT;
+                int32_t shifted = lgt - global_max;
+                int32_t ex = softmax_exp_lookup(shifted);
+                
+                running += ex;
+                if (running > s_thresh) {
+                    s_selected = v;
+                    break;
+                }
+            }
         }
         __syncthreads();
 
-        // Sample (Thread 0)
         if (t >= seed_len - 1) {
             if (tid == 0) {
-                long long sum_exp = 0;
-                for(int i=0; i<VOCAB_SIZE; i++) sum_exp += shared_logits[i];
-                
-                uint32_t s = seed + t * 555;
-                uint32_t r = hash_rng(s, 0);
-                long long thresh = (sum_exp > 0) ? (r % sum_exp) : 0;
-                long long running = 0;
-                int selected = 0;
-                for(int i=0; i<VOCAB_SIZE; i++) {
-                    running += shared_logits[i];
-                    if(running > thresh) { selected = i; break; }
-                }
-                buffer[t + 1] = (uint8_t)selected;
+                buffer[t + 1] = (TokenType)s_selected;
             }
         }
         __syncthreads();
@@ -1217,13 +1275,13 @@ struct GPUContext {
     cudaStream_t stream;
     TransformerModel *d_model;
     AdamModel *d_adam_state;
-    uint8_t *d_dataset;
+    TokenType *d_dataset;
     int32_t *d_loss;
     int32_t *d_fit;
     ActType *d_kv_cache;
     unsigned long long *d_updates_ptr;
     
-#ifdef USE_MUON
+#if USE_MUON == 1
     cublasHandle_t cublas_handle;
     MuonWorkspace muon_ws;
 #endif
@@ -1246,15 +1304,50 @@ int main() {
     if (num_devices == 0) { printf("No CUDA devices found!\n"); exit(1); }
     printf("Detected %d CUDA devices.\n", num_devices);
 
+    char **vocab_table = NULL;
+    uint32_t loaded_vocab_size = 0;
+
     printf("\n=== EGG TRANSFORMER ADAM MGPU ===\n");
     printf("AdamW Config: B1=%.3f B2=%.3f EPS=%.1e WD=%.4f (Dynamic LR)\n", 
            ADAM_BETA1, ADAM_BETA2, ADAM_EPS, ADAM_WEIGHT_DECAY);
 
     Dataset ds = {0,0};
+#ifdef USE_TOKENIZER
+    FILE *f = fopen("input.bin", "rb");
+    if(!f) { printf("No input.bin\n"); exit(1); }
+    fseek(f,0,SEEK_END); 
+    long file_size = ftell(f);
+    ds.length = file_size / sizeof(TokenType);
+    fseek(f,0,SEEK_SET);
+    ds.data = malloc(file_size);
+    if(fread(ds.data, 1, file_size, f) != file_size) { printf("Error reading input.bin\n"); exit(1); }
+    fclose(f);
+    printf("Loaded input.bin: %ld tokens (size %ld bytes)\n", ds.length, file_size);
+
+    FILE *fd = fopen("decoding.bin", "rb");
+    if(fd) {
+        if(fread(&loaded_vocab_size, sizeof(uint32_t), 1, fd) == 1) {
+            vocab_table = (char**)malloc(loaded_vocab_size * sizeof(char*));
+            for(uint32_t i=0; i<loaded_vocab_size; i++) {
+                uint32_t len; 
+                if(fread(&len, sizeof(uint32_t), 1, fd) != 1) break;
+                vocab_table[i] = (char*)malloc(len+1);
+                if(fread(vocab_table[i], 1, len, fd) != len) break;
+                vocab_table[i][len] = 0;
+            }
+            printf("Loaded decoding.bin: %u tokens\n", loaded_vocab_size);
+        }
+        fclose(fd);
+    }
+#else
     FILE *f = fopen("input.txt", "rb");
     if(!f) { printf("No input.txt\n"); exit(1); }
     fseek(f,0,SEEK_END); ds.length=ftell(f); fseek(f,0,SEEK_SET);
-    ds.data=(uint8_t*)malloc(ds.length); fread(ds.data,1,ds.length,f); fclose(f);
+    ds.data=malloc(ds.length); 
+    if(fread(ds.data, 1, ds.length, f) != ds.length) { printf("Error reading input.txt\n"); exit(1); }
+    fclose(f);
+    printf("Loaded input.txt: %ld bytes\n", ds.length);
+#endif
 
     TransformerModel *h_model = (TransformerModel*)calloc(1, sizeof(TransformerModel));
     AdamModel *h_adam_state = (AdamModel*)calloc(1, sizeof(AdamModel));
@@ -1276,7 +1369,7 @@ int main() {
         }
     } else {
         printf("No existing model found, initializing valid random model...\n");
-        init_model(h_model);
+        init_model(h_model, 42);
     }
     
     std::vector<GPUContext> gpus;
@@ -1322,7 +1415,7 @@ int main() {
     log_cfg.adam_eps = ADAM_EPS;
     log_cfg.adam_weight_decay = ADAM_WEIGHT_DECAY;
     
-#ifdef USE_MUON
+#if USE_MUON == 1
     log_cfg.use_muon = 1;
     log_cfg.muon_momentum = MUON_MOMENTUM;
     log_cfg.muon_lr_scale = MUON_LR_SCALE;
@@ -1345,13 +1438,19 @@ int main() {
         ctx.id = i;
         CHECK_CUDA(cudaStreamCreate(&ctx.stream));
         CHECK_CUDA(cudaMalloc(&ctx.d_model, sizeof(TransformerModel)));
+
+#if TOPOLOGY_DIVERGENCE
+        printf("TOPOLOGY_DIVERGENCE: Re-initializing model for GPU %d with seed %d\n", i, 42 + i);
+        init_model(h_model, 42 + i);
+#endif
+
         CHECK_CUDA(cudaMemcpy(ctx.d_model, h_model, sizeof(TransformerModel), cudaMemcpyHostToDevice));
         
         CHECK_CUDA(cudaMalloc(&ctx.d_adam_state, sizeof(AdamModel)));
         CHECK_CUDA(cudaMemcpy(ctx.d_adam_state, h_adam_state, sizeof(AdamModel), cudaMemcpyHostToDevice));
         
-        CHECK_CUDA(cudaMalloc(&ctx.d_dataset, ds.length));
-        CHECK_CUDA(cudaMemcpy(ctx.d_dataset, ds.data, ds.length, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMalloc(&ctx.d_dataset, ds.length * sizeof(TokenType)));
+        CHECK_CUDA(cudaMemcpy(ctx.d_dataset, ds.data, ds.length * sizeof(TokenType), cudaMemcpyHostToDevice));
         
         CHECK_CUDA(cudaMalloc(&ctx.d_loss, POPULATION_SIZE * sizeof(int32_t)));
         CHECK_CUDA(cudaMalloc(&ctx.d_fit, (POPULATION_SIZE/2) * sizeof(int32_t)));
@@ -1359,7 +1458,7 @@ int main() {
         
         CHECK_CUDA(cudaGetSymbolAddress((void**)&ctx.d_updates_ptr, d_total_updates));
         
-#ifdef USE_MUON
+#if USE_MUON == 1
         CHECK_CUBLAS(cublasCreate(&ctx.cublas_handle));
         CHECK_CUBLAS(cublasSetStream(ctx.cublas_handle, ctx.stream));
         // Allocate workspace for max size (MLP: HIDDEN_DIM * 4*HIDDEN_DIM)
@@ -1384,7 +1483,7 @@ int main() {
     int gen_seed_len = 32;
     int gen_output_len = 64; 
     int total_gen_len = gen_seed_len + gen_output_len;
-    uint8_t *d_gen_buf; CHECK_CUDA(cudaMalloc(&d_gen_buf, total_gen_len));
+    TokenType *d_gen_buf; CHECK_CUDA(cudaMalloc(&d_gen_buf, total_gen_len * sizeof(TokenType)));
     int8_t *d_gen_kv; CHECK_CUDA(cudaMalloc(&d_gen_kv, N_LAYERS * 2 * total_gen_len * HIDDEN_DIM));
 
     printf("Starting Training on %d GPUs...\n", num_devices);
@@ -1466,7 +1565,7 @@ int main() {
         (WeightType*)V_PTR, (AdamParam*)ADAM_PTR, LEN, SEED_A, SEED_B, \
         BASE, gpus[i].d_fit, seed, current_lr * LR_SCALE)
 
-#ifdef USE_MUON
+#if USE_MUON == 1
     // Muon update O has norm 1. Adam update g/sqrt(v) has magnitude ~1.
     // We scale Muon by a factor to match expected update magnitude for int8 weights.
     // heuristic: sqrt(HIDDEN_DIM) or similar might be needed, but start with 1.0 * LR
@@ -1586,16 +1685,27 @@ int main() {
         if (step % 5 == 0) {
             // Generation on GPU 0
             CHECK_CUDA(cudaSetDevice(gpus[0].id));
-            CHECK_CUDA(cudaMemcpy(d_gen_buf, gpus[0].d_dataset + (step*SEQ_LEN) % (ds.length-SEQ_LEN), gen_seed_len, cudaMemcpyDeviceToDevice));
+            CHECK_CUDA(cudaMemcpy(d_gen_buf, gpus[0].d_dataset + (step*SEQ_LEN) % (ds.length-SEQ_LEN), gen_seed_len * sizeof(TokenType), cudaMemcpyDeviceToDevice));
             generate_sequence_kernel<<<1, BLOCK_THREADS, sm_size, gpus[0].stream>>>(
                 d_gen_buf, gen_seed_len, gen_output_len, gpus[0].d_model, d_gen_kv, seed+999
             );
             CHECK_CUDA(cudaStreamSynchronize(gpus[0].stream));
-            uint8_t h_buf[256];
-            CHECK_CUDA(cudaMemcpy(h_buf, d_gen_buf, total_gen_len, cudaMemcpyDeviceToHost));
+            TokenType h_buf[256];
+            CHECK_CUDA(cudaMemcpy(h_buf, d_gen_buf, total_gen_len * sizeof(TokenType), cudaMemcpyDeviceToHost));
             
             printf("\n--- GENERATION ---\n");
             printf("\033[32m"); 
+#ifdef USE_TOKENIZER
+            for(int i=0; i<gen_seed_len; i++) {
+                if(vocab_table && h_buf[i] < loaded_vocab_size) printf("%s", vocab_table[h_buf[i]]);
+                else printf("%u ", h_buf[i]);
+            }
+            printf("\033[36m"); 
+            for(int i=gen_seed_len; i<total_gen_len; i++) {
+                if(vocab_table && h_buf[i] < loaded_vocab_size) printf("%s", vocab_table[h_buf[i]]);
+                else printf("%u ", h_buf[i]);
+            }
+#else
             for(int i=0; i<gen_seed_len; i++) {
                 char c = h_buf[i]; printf("%c", (c>=32 && c<=126) ? c : '.');
             }
@@ -1603,12 +1713,13 @@ int main() {
             for(int i=gen_seed_len; i<total_gen_len; i++) {
                 char c = h_buf[i]; printf("%c", (c>=32 && c<=126) ? c : '.');
             }
+#endif
             printf("\033[0m\n\n");
 
             // Save Model from GPU 0
-            CHECK_CUDA(cudaMemcpy(h_model, gpus[0].d_model, sizeof(TransformerModel), cudaMemcpyDeviceToHost));
-            CHECK_CUDA(cudaMemcpy(h_adam_state, gpus[0].d_adam_state, sizeof(AdamModel), cudaMemcpyDeviceToHost));
-            save_checkpoint(h_model, h_adam_state, step);
+            //CHECK_CUDA(cudaMemcpy(h_model, gpus[0].d_model, sizeof(TransformerModel), cudaMemcpyDeviceToHost));
+            //CHECK_CUDA(cudaMemcpy(h_adam_state, gpus[0].d_adam_state, sizeof(AdamModel), cudaMemcpyDeviceToHost));
+            //save_checkpoint(h_model, h_adam_state, step);
         }
     }
     
@@ -1626,7 +1737,7 @@ int main() {
         cudaFree(ctx.d_fit);
         cudaFree(ctx.d_kv_cache);
         cudaFree(ctx.d_adam_state);
-#ifdef USE_MUON
+#if USE_MUON == 1
         if(ctx.cublas_handle) cublasDestroy(ctx.cublas_handle);
         cudaFree(ctx.muon_ws.d_buf1);
         cudaFree(ctx.muon_ws.d_buf2);
