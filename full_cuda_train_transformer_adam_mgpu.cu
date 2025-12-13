@@ -33,7 +33,7 @@ void handle_sigint(int sig) {
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 512
+#  define HIDDEN_DIM 256
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64
@@ -209,12 +209,22 @@ using TokenType = uint8_t;
 #  define TOPOLOGY_DIVERGENCE 0
 #endif
 
+#ifndef USE_SAME_DATA
+#  define USE_SAME_DATA 0
+#endif
+
 // ADAM HYPERPARAMS
 float get_learning_rate(long step) {
-    return 0.3f;
-    if (step < 100) {
-        return 1.0f;
+    if (step < 300) {
+        return 0.3f;
     }
+    if (step < 600) {
+        return 0.15f;
+    }
+    if (step < 1000) {
+        return 0.075f;
+    }
+    return 0.05f;
     if (step < 200) {
         return 0.5f;
     }
@@ -247,7 +257,7 @@ float get_learning_rate(long step) {
 #endif
 
 #ifndef USE_MUON
-#  define USE_MUON 1
+#  define USE_MUON 0
 #endif
 
 #if USE_MUON
@@ -853,7 +863,11 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
 
     long pair_idx = p_idx / 2;
     long stride = data_len / (POPULATION_SIZE / 2);
+#if USE_SAME_DATA == 1
+    long stream_pos = start_idx % (data_len - SEQ_LEN);
+#else
     long stream_pos = (start_idx + (pair_idx * stride)) % (data_len - SEQ_LEN);
+#endif
     int ns = (p_idx % 2 == 0) ? 1 : -1;
     size_t kv_layer_stride = 2ULL * SEQ_LEN * HIDDEN_DIM;
     size_t kv_ind_offset = (size_t)blockIdx.x * N_LAYERS * kv_layer_stride;
