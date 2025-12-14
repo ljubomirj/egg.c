@@ -38,10 +38,14 @@ EGG_GPU_MULTI_SRC := full_trained_egg-gpumulti.c
 EGG_GPU_METAL_SRC := full_trained_egg-gpu-metal.mm
 EGG_GPU_METAL_OPTIMIZED_SRC := full_trained_egg-gpu-metal-optimized.mm
 EGG_GPU_OPTIMIZED_SRC := full_trained_egg-gpu-optimized.c
+EGG_GPU_TRAIN_CUDA_SRC := full_cuda_train_egg.cu
 EGG_GPU_METAL_OBJ := $(BUILD_DIR)/full_trained_egg-gpumulti-metal$(BUILD_SUFFIX).o
 EGG_GPU_METAL_MM_OBJ := $(BUILD_DIR)/full_trained_egg-gpu-metal$(BUILD_SUFFIX).o
 EGG_GPU_METAL_OPTIMIZED_OBJ := $(BUILD_DIR)/full_trained_egg-gpu-metal-optimized$(BUILD_SUFFIX).o
 EGG_GPU_OPTIMIZED_OBJ := $(BUILD_DIR)/full_trained_egg-gpu-optimized$(BUILD_SUFFIX).o
+
+# ROCm/HIP toolchain (Linux)
+HIPCC ?= /opt/rocm/bin/hipcc
 
 .PHONY: all clean gpu-targets
 
@@ -114,6 +118,16 @@ $(BUILD_DIR)/egg-gpu-linux-vulcan$(BUILD_SUFFIX): $(EGG_GPU_MULTI_SRC) | $(BUILD
 	$(CC) $(GPU_STUB_FLAGS) $(DEPFLAGS) -DEGG_GPU_BACKEND=EGG_GPU_BACKEND_VULKAN -o $@
 	@echo "[$@ done]"
 
+# Run line-buffered so you see prints: stdbuf -oL -eL ./build/egg-train-gpu-linux-rocm.debug
+$(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX): $(EGG_GPU_TRAIN_CUDA_SRC) | $(BUILD_DIR)
+ifeq ($(UNAME_S),Linux)
+	@echo "==> $@ ROCm/HIP training build building..."
+	$(HIPCC) $(OPTFLAGS) -std=c++17 --offload-arch=gfx1100 -mno-wavefrontsize64 -MMD -MP -MF $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX).d $(EGG_GPU_TRAIN_CUDA_SRC) -lm -o $@
+	@echo "[$@ done]"
+else
+	@echo "Target $@ is only supported on Linux."
+endif
+
 $(BUILD_DIR)/egg-gpu-optimized$(BUILD_SUFFIX): $(EGG_GPU_OPTIMIZED_SRC) $(EGG_GPU_METAL_OPTIMIZED_SRC) | $(BUILD_DIR)
 ifeq ($(UNAME_S),Darwin)
 	@echo "==> $@ Optimized Metal GPU build building..."
@@ -127,7 +141,7 @@ else
 	@echo "Target $@ is only supported on macOS, while this is $(UNAME_S)"
 endif
 
-gpu-targets: $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-cuda$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-vulcan$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-optimized$(BUILD_SUFFIX)
+gpu-targets: $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-cuda$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-vulcan$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-optimized$(BUILD_SUFFIX)
 
 clean:
 	rm -rf $(BUILD_DIR)

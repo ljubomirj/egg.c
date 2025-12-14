@@ -1,14 +1,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <math.h>
 #include <time.h>
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
+#include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#else
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <cub/cub.cuh>
+#endif
 #include <signal.h>
 #include <unistd.h>
 
-#include <cub/cub.cuh>
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
 #include <thrust/transform_reduce.h>
@@ -63,6 +71,31 @@ void handle_sigint(int sig) {
         exit(1); \
     } \
 }
+
+#if defined(__HIPCC__)
+// Minimal CUDA runtime API shims for building this .cu file with hipcc on AMD.
+// Keep the rest of the code unchanged for easier upstream rebases.
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaGetErrorString hipGetErrorString
+#define cudaDeviceProp hipDeviceProp_t
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaMalloc hipMalloc
+#define cudaFree hipFree
+#define cudaMemset hipMemset
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyKind hipMemcpyKind
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemcpyToSymbol(symbol, src, count) hipMemcpyToSymbol(HIP_SYMBOL(symbol), (src), (count), 0, hipMemcpyHostToDevice)
+#define cudaMemcpyFromSymbol(dst, symbol, count, offset, kind) hipMemcpyFromSymbol((dst), HIP_SYMBOL(symbol), (count), (offset), (kind))
+
+// CUDA uses __shfl_sync; HIP on AMD uses __shfl with an explicit width.
+#ifndef __shfl_sync
+#define __shfl_sync(mask, var, src_lane) __shfl((var), (src_lane), WARP_SIZE)
+#endif
+#endif
 
 // --- Data Structures ---
 typedef struct {
