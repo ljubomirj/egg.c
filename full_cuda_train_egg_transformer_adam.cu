@@ -1,10 +1,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <math.h>
 #include <time.h>
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
+#include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#else
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <cub/cub.cuh>
+#endif
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -16,7 +25,6 @@
 #include <thrust/transform_reduce.h>
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
-#include <cub/cub.cuh>
 
 #include "egg_debug_printer.h"
 #include "egg_adaptive_normalize.h"
@@ -27,6 +35,27 @@ void handle_sigint(int sig) {
     const char msg[] = "\n[SIGINT] Interrupt received. Stopping after current step...\n";
     write(STDOUT_FILENO, msg, sizeof(msg)-1);
     keep_running = 0;
+}
+
+static void format_local_datetime(char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    time_t now = time(NULL);
+    struct tm tm_now;
+    if (!localtime_r(&now, &tm_now)) {
+        out[0] = '\0';
+        return;
+    }
+    strftime(out, out_size, "%Y-%m-%d %H:%M:%S", &tm_now);
+}
+
+static const char *build_name(void) {
+#if defined(NDEBUG)
+    return "release";
+#elif defined(DEBUG)
+    return "debug";
+#else
+    return "unknown";
+#endif
 }
 
 // --- CONFIGURATION ---
@@ -116,6 +145,39 @@ float get_learning_rate(long step) {
 #define ADAM_WEIGHT_DECAY 0.01f
 
 #define CHECK_CUDA(call) { cudaError_t err = call; if (err != cudaSuccess) { printf("CUDA Error: %s:%d\n", cudaGetErrorString(err), __LINE__); exit(1); } }
+
+#if defined(__HIPCC__)
+// Minimal CUDA runtime API shims for building this .cu file with hipcc on AMD.
+// Keep the rest of the code unchanged for easier upstream rebases.
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaGetErrorString hipGetErrorString
+#define cudaDeviceProp hipDeviceProp_t
+#define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaMalloc hipMalloc
+#define cudaFree hipFree
+#define cudaMemset hipMemset
+#define cudaMemcpy hipMemcpy
+#define cudaMemcpyKind hipMemcpyKind
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define cudaGetSymbolAddress(dev_ptr, symbol) hipGetSymbolAddress((dev_ptr), HIP_SYMBOL(symbol))
+#define cudaMemcpyToSymbol(symbol, src, count) hipMemcpyToSymbol(HIP_SYMBOL(symbol), (src), (count), 0, hipMemcpyHostToDevice)
+#define cudaMemcpyFromSymbol(dst, symbol, count, offset, kind) hipMemcpyFromSymbol((dst), HIP_SYMBOL(symbol), (count), (offset), (kind))
+
+// HIP's *_sync intrinsics use a 64-bit mask on AMD; map them to the non-sync variants
+// since this code always assumes full-warp participation (warp size 32).
+#undef __shfl_sync
+#undef __shfl_down_sync
+#undef __shfl_xor_sync
+#undef __shfl_up_sync
+#define __shfl_sync(mask, var, src_lane) __shfl((var), (src_lane), 32)
+#define __shfl_down_sync(mask, var, delta) __shfl_down((var), (delta), 32)
+#define __shfl_xor_sync(mask, var, lane_mask) __shfl_xor((var), (lane_mask), 32)
+#define __shfl_up_sync(mask, var, delta) __shfl_up((var), (delta), 32)
+#endif
 
 // --- TYPE ALIASES ---
 using WeightType    = int8_t;
@@ -336,7 +398,19 @@ __device__ __forceinline__ int32_t softmax_exp_lookup(int32_t diff) {
 }
 
 __device__ __forceinline__ int simd_dp4a(int a, int b, int c) {
+#if defined(__HIPCC__)
+    int8_t a0 = (int8_t)(a);
+    int8_t a1 = (int8_t)(a >> 8);
+    int8_t a2 = (int8_t)(a >> 16);
+    int8_t a3 = (int8_t)(a >> 24);
+    int8_t b0 = (int8_t)(b);
+    int8_t b1 = (int8_t)(b >> 8);
+    int8_t b2 = (int8_t)(b >> 16);
+    int8_t b3 = (int8_t)(b >> 24);
+    return c + (int)a0 * (int)b0 + (int)a1 * (int)b1 + (int)a2 * (int)b2 + (int)a3 * (int)b3;
+#else
     return __dp4a(a, b, c);
+#endif
 }
 
 __device__ __forceinline__ AccumType compute_linear_projection(
@@ -638,13 +712,6 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     long long my_loss = 0; // Loss accumulation needs high precision
 
     for (int t = 0; t < SEQ_LEN; t++) {
-        
-        if (step%5 == 0 && global_pop_offset == 0 && blockIdx.x == 0 && tid == 0 && t == 0) {
-             printf("DEBUG: Dataset[0..10] at stream_pos=%ld: ", stream_pos);
-             for(int i=0; i<10 && stream_pos+i < data_len; i++) printf("%d(%c) ", dataset[stream_pos+i], (dataset[stream_pos+i]>=32 && dataset[stream_pos+i]<=126) ? dataset[stream_pos+i] : '.');
-             printf("\n");
-        }
-
         // 1. Embedding
         uint8_t input_token = dataset[stream_pos + t];
         uint32_t seed_emb = (step_seed + pair_idx) + SEED_OFF_EMB;
@@ -976,12 +1043,19 @@ __global__ void generate_sequence_kernel(
 
 #include "egg_disk_utils.h"
 
-int main() {
+int main(int argc, char **argv) {
     signal(SIGINT, handle_sigint);
     init_tables();
-    cudaMemcpyToSymbol(d_EXP_LUT, h_EXP_LUT, SOFTMAX_LUT_SIZE*sizeof(int32_t));
-    cudaMemcpyToSymbol(d_ACT_LUT, h_ACT_LUT, 256*sizeof(int8_t));
-    cudaMemcpyToSymbol(d_ROPE_LUT, h_ROPE_LUT, ROPE_LUT_SIZE*sizeof(int32_t));
+    CHECK_CUDA(cudaMemcpyToSymbol(d_EXP_LUT, h_EXP_LUT, SOFTMAX_LUT_SIZE*sizeof(int32_t)));
+    CHECK_CUDA(cudaMemcpyToSymbol(d_ACT_LUT, h_ACT_LUT, 256*sizeof(int8_t)));
+    CHECK_CUDA(cudaMemcpyToSymbol(d_ROPE_LUT, h_ROPE_LUT, ROPE_LUT_SIZE*sizeof(int32_t)));
+
+    char datetime[64];
+    format_local_datetime(datetime, sizeof(datetime));
+    printf("Starting EGG TRANSFORMER ADAM HIP/CUDA | Binary: %s | BUILD=%s | Datetime: %s\n",
+           (argc > 0 && argv && argv[0]) ? argv[0] : "(unknown)",
+           build_name(),
+           datetime[0] ? datetime : "(unknown)");
 
     printf("\n=== EGG TRANSFORMER ADAM ===\n");
     printf("AdamW Config: B1=%.3f B2=%.3f EPS=%.1e WD=%.4f (Dynamic LR)\n", 
@@ -1054,6 +1128,18 @@ int main() {
     for(long step=0; step<max_steps && keep_running; step++) {
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
         uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x12345678);
+
+        if (step % 5 == 0) {
+            char dbg_datetime[64];
+            format_local_datetime(dbg_datetime, sizeof(dbg_datetime));
+            long stream_pos = (step * (long)SEQ_LEN) % (ds.length - SEQ_LEN);
+            printf("DEBUG: Dataset[0..10] at stream_pos=%ld: ", stream_pos);
+            for (int i = 0; i < 10 && stream_pos + i < ds.length; i++) {
+                uint8_t v = ds.data[stream_pos + i];
+                printf("%d(%c) ", v, (v >= 32 && v <= 126) ? (char)v : '.');
+            }
+            printf("| Datetime: %s\n", dbg_datetime[0] ? dbg_datetime : "(unknown)");
+        }
         
         size_t sm_size = 2 * HIDDEN_DIM + 512 + (4*HIDDEN_DIM); 
         for (int offset = 0; offset < POPULATION_SIZE; offset += POPULATION_BATCH_SIZE) {
@@ -1128,14 +1214,14 @@ int main() {
         CHECK_CUDA(cudaMemcpy(&h_updates, d_updates_ptr, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         
         double step_ms = get_time_diff_ms(t0, t1);
-        double tokens_per_sec = (double)(POPULATION_SIZE * SEQ_LEN) / (step_ms / 1000.0);
+        double mtok_per_sec = (step_ms > 0) ? (((double)POPULATION_SIZE * (double)SEQ_LEN) / (step_ms / 1000.0) / 1000000.0) : 0.0;
 
         thrust::device_ptr<int32_t> t_loss(d_loss);
         long long total_loss = thrust::reduce(t_loss, t_loss + POPULATION_SIZE, (long long)0);
         double avg_loss = (double)total_loss / (POPULATION_SIZE * SEQ_LEN * 16.0); 
 
-        printf("Step %ld | Loss: %.4f | Time: %.2f ms | Updates: %llu | Speed: %.2f tok/s | LR: %.3f\n", 
-            step, avg_loss, step_ms, h_updates, tokens_per_sec, current_lr);
+        printf("Step %ld | Loss: %.4f | Time: %.2f ms | Updates: %llu | Speed: %.6f MTok/s | LR: %.3f\n",
+            step, avg_loss, step_ms, h_updates, mtok_per_sec, current_lr);
 
         if (step % 5 == 0) {
             CHECK_CUDA(cudaMemcpy(d_gen_buf, d_dataset + (step*SEQ_LEN) % (ds.length-SEQ_LEN), gen_seed_len, cudaMemcpyDeviceToDevice));
@@ -1162,10 +1248,15 @@ int main() {
             save_checkpoint(h_model, h_adam_state, step);
         }
     }
-    cudaFree(d_gen_buf); cudaFree(d_gen_kv);
+    CHECK_CUDA(cudaFree(d_gen_buf));
+    CHECK_CUDA(cudaFree(d_gen_kv));
 
     free(h_model); free(h_adam_state); free(ds.data);
-    cudaFree(d_model); cudaFree(d_dataset); cudaFree(d_loss); cudaFree(d_fit); cudaFree(d_kv_cache);
-    cudaFree(d_adam_state);
+    CHECK_CUDA(cudaFree(d_model));
+    CHECK_CUDA(cudaFree(d_dataset));
+    CHECK_CUDA(cudaFree(d_loss));
+    CHECK_CUDA(cudaFree(d_fit));
+    CHECK_CUDA(cudaFree(d_kv_cache));
+    CHECK_CUDA(cudaFree(d_adam_state));
     return 0;
 }
