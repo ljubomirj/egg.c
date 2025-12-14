@@ -51,7 +51,7 @@ HIPCC ?= /opt/rocm/bin/hipcc
 
 .PHONY: all clean gpu-targets
 
-all: $(BUILD_DIR)/egg$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-linux-amd64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-macos-arm64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpumulti$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
+all: $(BUILD_DIR)/egg$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-linux-amd64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-macos-arm64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpumulti$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
 
 # Create build directory if it doesn't exist
 $(BUILD_DIR):
