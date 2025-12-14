@@ -58,7 +58,7 @@ https://github.com/ESHyperscale/nano-egg
 ## Security & Config Tips
 - Inputs are local text/zst files; no network fetch in training loop.
 - Avoid writing to arbitrary paths; temp artifacts live in `/tmp/egg_*`.
-- Keep `README.LJ` untouched (owner-maintained personal notes).
+- Do not write do not change README.LJ - it's owner-maintained personal notes by myself, LJ. Do read though to see the history of changes.
 
 ## Overview
 

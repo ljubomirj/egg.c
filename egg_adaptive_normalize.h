@@ -1,8 +1,20 @@
 #ifndef EGG_ADAPTIVE_NORMALIZE_H
 #define EGG_ADAPTIVE_NORMALIZE_H
 
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
+#else
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#endif
+
+#if defined(__HIPCC__)
+// HIP's *_sync intrinsics use a 64-bit mask on AMD; map them to the non-sync variants
+// since this code always assumes full-warp participation (warp size 32).
+#undef __shfl_down_sync
+#define __shfl_down_sync(mask, var, delta) __shfl_down((var), (delta), 32)
+#endif
 
 // Helper for Adaptive QKV Normalization
 // Normalizes values layer-wise (across all warps/heads)
