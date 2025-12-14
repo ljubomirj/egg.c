@@ -53,6 +53,9 @@ struct GlobalState {
     uint64_t step_max_updates = 0;
     uint64_t step_transmissions = 0;
     
+    double prev_loss = 0.0;
+    uint64_t prev_max_updates = 0;
+
     std::chrono::steady_clock::time_point step_start_time;
 
     std::mutex mutex;
@@ -328,10 +331,32 @@ void handle_client(int sock) {
                         uint64_t recv = g_bytes_received.load();
                         double net_mbps = (double)(sent + recv) / (step_ms / 1000.0) / (1024.0 * 1024.0);
 
+                        // Determine colors
+                        const char* loss_color = "";
+                        if (g_state.current_step > 0) {
+                            if (avg_loss < g_state.prev_loss) loss_color = "\033[92m"; // Bright Green
+                            else if (avg_loss > g_state.prev_loss) loss_color = "\033[91m"; // Bright Red
+                        }
+                        
+                        const char* updates_color = "";
+                        if (g_state.current_step > 0) {
+                            if (g_state.step_max_updates > g_state.prev_max_updates) updates_color = "\033[36m"; // Cyan
+                            else if (g_state.step_max_updates < g_state.prev_max_updates) updates_color = "\033[34m"; // Blue
+                        }
+                        const char* reset_color = "\033[0m";
+
                         // Print Log
-                        printf("Step %" PRIu64 " | Loss: %.4f | Time: %.2f ms | Updates: %" PRIu64 " (n=%" PRIu64 ", min=%" PRIu64 ", max=%" PRIu64 ") | Speed: %.2f tok/s | LR: %.3f | Net: %.2f MB/s (Tx: %s, Rx: %s)\n", 
-                               g_state.current_step, avg_loss, step_ms, g_state.step_total_updates, g_state.step_transmissions, g_state.step_min_updates, g_state.step_max_updates, tokens_per_sec, current_lr, net_mbps,
+                        printf("Step %" PRIu64 " | Loss: %s%.4f%s | Time: %.2f ms | Updates: %" PRIu64 " (n=%" PRIu64 ", min=%" PRIu64 ", max=%s%" PRIu64 "%s) | Speed: %.2f tok/s | LR: %.3f | Net: %.2f MB/s (Tx: %s, Rx: %s)\n", 
+                               g_state.current_step, 
+                               loss_color, avg_loss, reset_color,
+                               step_ms, g_state.step_total_updates, g_state.step_transmissions, g_state.step_min_updates, 
+                               updates_color, g_state.step_max_updates, reset_color,
+                               tokens_per_sec, current_lr, net_mbps,
                                humanize_bytes(sent).c_str(), humanize_bytes(recv).c_str());
+
+                        // Update previous values
+                        g_state.prev_loss = avg_loss;
+                        g_state.prev_max_updates = g_state.step_max_updates;
 
                         // Remote logging
                         egg_log_record(&g_log_state, g_state.current_step, avg_loss, 
