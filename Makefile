@@ -43,13 +43,15 @@ EGG_GPU_METAL_OBJ := $(BUILD_DIR)/full_trained_egg-gpumulti-metal$(BUILD_SUFFIX)
 EGG_GPU_METAL_MM_OBJ := $(BUILD_DIR)/full_trained_egg-gpu-metal$(BUILD_SUFFIX).o
 EGG_GPU_METAL_OPTIMIZED_OBJ := $(BUILD_DIR)/full_trained_egg-gpu-metal-optimized$(BUILD_SUFFIX).o
 EGG_GPU_OPTIMIZED_OBJ := $(BUILD_DIR)/full_trained_egg-gpu-optimized$(BUILD_SUFFIX).o
+EGG_GPU_MACOS_METAL_OPTIMIZED_BIN := $(BUILD_DIR)/egg-gpu-macos-metal-optimized$(BUILD_SUFFIX)
+EGG_GPU_OPTIMIZED_COMPAT_BIN := $(BUILD_DIR)/egg-gpu-optimized$(BUILD_SUFFIX)
 
 # ROCm/HIP toolchain (Linux)
 HIPCC ?= /opt/rocm/bin/hipcc
 
 .PHONY: all clean gpu-targets
 
-all: $(BUILD_DIR)/egg$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-linux-amd64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-macos-arm64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpumulti$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-optimized$(BUILD_SUFFIX)
+all: $(BUILD_DIR)/egg$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-linux-amd64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-macos-arm64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpumulti$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
 
 # Create build directory if it doesn't exist
 $(BUILD_DIR):
@@ -128,7 +130,7 @@ else
 	@echo "Target $@ is only supported on Linux."
 endif
 
-$(BUILD_DIR)/egg-gpu-optimized$(BUILD_SUFFIX): $(EGG_GPU_OPTIMIZED_SRC) $(EGG_GPU_METAL_OPTIMIZED_SRC) | $(BUILD_DIR)
+$(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN): $(EGG_GPU_OPTIMIZED_SRC) $(EGG_GPU_METAL_OPTIMIZED_SRC) | $(BUILD_DIR)
 ifeq ($(UNAME_S),Darwin)
 	@echo "==> $@ Optimized Metal GPU build building..."
 	$(CC) $(OPTFLAGS) $(BLOCKS_FLAGS) $(DEPFLAGS) -c $(EGG_GPU_OPTIMIZED_SRC) -o $(EGG_GPU_OPTIMIZED_OBJ)
@@ -141,7 +143,17 @@ else
 	@echo "Target $@ is only supported on macOS, while this is $(UNAME_S)"
 endif
 
-gpu-targets: $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-cuda$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-vulcan$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-optimized$(BUILD_SUFFIX)
+# Compatibility alias: keep the old binary name around for scripts/tools that still expect it.
+$(EGG_GPU_OPTIMIZED_COMPAT_BIN): $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN) | $(BUILD_DIR)
+ifeq ($(UNAME_S),Darwin)
+	@echo "==> $@ Compatibility alias building..."
+	cp -f $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN) $@
+	@echo "[$@ done]"
+else
+	@echo "Target $@ is only supported on macOS, while this is $(UNAME_S)"
+endif
+
+gpu-targets: $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-cuda$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-vulcan$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -10,7 +10,7 @@ export EGG_USE_OPTIMIZED_METAL=1
 
 # Build and test the optimized version
 echo "Building optimized GPU implementation..."
-make build/egg-gpu-optimized.debug
+make build/egg-gpu-macos-metal-optimized.debug
 
 if [ $? -eq 0 ]; then
     echo "Build successful!"
@@ -20,7 +20,7 @@ if [ $? -eq 0 ]; then
     echo
 
     # Run with a small test
-    time ./build/egg-gpu-optimized.debug 2>&1 | head -20
+    time ./build/egg-gpu-macos-metal-optimized.debug 2>&1 | head -20
 
     echo
     echo "=== Performance Comparison ==="
@@ -28,7 +28,7 @@ if [ $? -eq 0 ]; then
     echo "To compare with original implementations:"
     echo "1. Original CPU: time ./build/egg-cpu-macos-arm64.debug"
     echo "2. Original Metal: time ./build/egg-gpu-macos-metal.debug"
-    echo "3. Optimized Metal: time ./build/egg-gpu-optimized.debug (with EGG_USE_OPTIMIZED_METAL=1)"
+    echo "3. Optimized Metal: time ./build/egg-gpu-macos-metal-optimized.debug (with EGG_USE_OPTIMIZED_METAL=1)"
     echo
 else
     echo "Build failed!"
