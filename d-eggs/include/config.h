@@ -3,13 +3,13 @@
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 256
+#  define HIDDEN_DIM 512
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64
 #endif
 #ifndef N_LAYERS
-#  define N_LAYERS 4
+#  define N_LAYERS 18
 #endif
 #ifndef SEQ_LEN
 #  define SEQ_LEN 32
@@ -20,7 +20,7 @@
 #  define NTT_MODE 0
 #endif
 #ifndef VOCAB_SIZE
-#  define VOCAB_SIZE 151643
+#  define VOCAB_SIZE 8192
 #endif
 
 #if VOCAB_SIZE != 256

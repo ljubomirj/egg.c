@@ -23,8 +23,8 @@
 // Constants
 #define PORT 12345
 // CHUNK_SIZE is defined in config.h
-#define MAX_HISTORY 10
-#define STRAGGLER_TIMEOUT_MS 30000  // 30 seconds before re-assigning a chunk
+#define MAX_HISTORY 500
+#define STRAGGLER_TIMEOUT_MS 90000  // 90 seconds before re-assigning a chunk
 
 // Network Stats (global atomics)
 std::atomic<uint64_t> g_bytes_sent(0);
@@ -47,6 +47,9 @@ struct GlobalState {
     std::deque<int> chunk_queue;         // Queue of chunks to assign
     int chunks_remaining = 0;
     uint64_t step_total_updates = 0;     // Aggregated updates for current step
+    uint64_t step_min_updates = UINT64_MAX;
+    uint64_t step_max_updates = 0;
+    uint64_t step_transmissions = 0;
     
     std::chrono::steady_clock::time_point step_start_time;
 
@@ -273,15 +276,18 @@ void handle_client(int sock) {
             std::lock_guard<std::mutex> lock(g_state.mutex);
             
             if (res.last_step == g_state.current_step) {
+                // Track updates stats (count every transmission)
+                g_state.step_transmissions++;
+                g_state.step_total_updates += res.updates_count;
+                if (res.updates_count < g_state.step_min_updates) g_state.step_min_updates = res.updates_count;
+                if (res.updates_count > g_state.step_max_updates) g_state.step_max_updates = res.updates_count;
+
                 // Clear in-progress flag (even if already completed by another worker)
                 g_state.chunk_in_progress[chunk_idx] = false;
                 
                 if (!g_state.chunk_completed[chunk_idx]) {
                     g_state.chunk_completed[chunk_idx] = true;
                     g_state.chunks_remaining--;
-                    
-                    // Aggregate updates count
-                    g_state.step_total_updates += res.updates_count;
                     
                     // Copy losses
                     for(int i=0; i<count; i++) {
@@ -314,8 +320,8 @@ void handle_client(int sock) {
                         double net_mbps = (double)(sent + recv) / (step_ms / 1000.0) / (1024.0 * 1024.0);
 
                         // Print Log
-                        printf("Step %" PRIu64 " | Loss: %.4f | Time: %.2f ms | Updates: %" PRIu64 " | Speed: %.2f tok/s | LR: %.3f | Net: %.2f MB/s (Tx: %s, Rx: %s)\n", 
-                               g_state.current_step, avg_loss, step_ms, g_state.step_total_updates, tokens_per_sec, current_lr, net_mbps,
+                        printf("Step %" PRIu64 " | Loss: %.4f | Time: %.2f ms | Updates: %" PRIu64 " (n=%" PRIu64 ", min=%" PRIu64 ", max=%" PRIu64 ") | Speed: %.2f tok/s | LR: %.3f | Net: %.2f MB/s (Tx: %s, Rx: %s)\n", 
+                               g_state.current_step, avg_loss, step_ms, g_state.step_total_updates, g_state.step_transmissions, g_state.step_min_updates, g_state.step_max_updates, tokens_per_sec, current_lr, net_mbps,
                                humanize_bytes(sent).c_str(), humanize_bytes(recv).c_str());
 
                         // Remote logging
@@ -342,6 +348,9 @@ void handle_client(int sock) {
                         
                         std::fill(g_state.current_losses.begin(), g_state.current_losses.end(), 0);
                         g_state.step_total_updates = 0;  // Reset updates counter
+                        g_state.step_min_updates = UINT64_MAX;
+                        g_state.step_max_updates = 0;
+                        g_state.step_transmissions = 0;
                         g_state.step_start_time = std::chrono::steady_clock::now();
                         
                         // Reset network counters for next step
