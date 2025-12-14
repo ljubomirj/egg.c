@@ -62,7 +62,7 @@ typedef struct {
 
 // Evaluate entire population in one GPU call
 static bool evaluate_population_optimized(
-    const EggModel *model,
+    EggModel *model,
     const Dataset *ds,
     long start_idx,
     int *pair_fitnesses,
@@ -79,9 +79,12 @@ static bool evaluate_population_optimized(
         // Check if we should use optimized Metal
         const char *use_optimized = getenv("EGG_USE_OPTIMIZED_METAL");
         if (use_optimized && use_optimized[0] == '1') {
+            printf("[EGG OPT] Attempting to initialize optimized Metal implementation...\n");
             metal_initialized = egg_gpu_metal_optimized_init();
             if (metal_initialized) {
                 printf("[EGG OPT] Using optimized Metal implementation\n");
+            } else {
+                printf("[EGG OPT] Failed to initialize optimized Metal, falling back to CPU\n");
             }
         }
     }
@@ -237,20 +240,31 @@ static Dataset load_dataset(const char *filename) {
         }
     }
 
-    if (strstr(filename, ".zst") != NULL || f != fopen(zst_filename, "rb")) {
-        // Load compressed file
+    // Check if zst file exists
+    FILE *fzst = fopen(zst_filename, "rb");
+    if (fzst) {
+        fclose(fzst);
         fclose(f);
 
-        // Use zstd to decompress
+        // Use zstd to decompress to temporary file first
+        char tmp_filename[] = "/tmp/egg_datasetXXXXXX";
+        mkstemp(tmp_filename);
+
         char cmd[2048];
-        snprintf(cmd, sizeof(cmd), "zstd -dc %s", zst_filename);
-        f = popen(cmd, "rb");
-        if (!f) {
+        // Use zstd with -f flag to force decompression even for symlinks
+        snprintf(cmd, sizeof(cmd), "zstd -dc %s > %s", "wikitext_combined-head-35111.txt.zst", tmp_filename);
+        if (system(cmd) != 0) {
             fprintf(stderr, "Error: Could not decompress %s\n", zst_filename);
             exit(1);
         }
 
-        // Get file size
+        // Now read the decompressed file
+        f = fopen(tmp_filename, "rb");
+        if (!f) {
+            fprintf(stderr, "Error: Could not open temporary file\n");
+            exit(1);
+        }
+
         fseek(f, 0, SEEK_END);
         ds.length = ftell(f);
         fseek(f, 0, SEEK_SET);
@@ -266,7 +280,8 @@ static Dataset load_dataset(const char *filename) {
             exit(1);
         }
 
-        pclose(f);
+        fclose(f);
+        unlink(tmp_filename);  // Remove temporary file
     } else {
         // Load uncompressed file
         fseek(f, 0, SEEK_END);
@@ -294,8 +309,7 @@ static Dataset load_dataset(const char *filename) {
 // --- Signal Handling ---
 volatile sig_atomic_t keep_running = 1;
 void handle_sigint(int sig) {
-    const char msg[] = "\n[SIGINT] Interrupt received. Stopping after current step...\n";
-    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    printf("\n[SIGINT] Interrupt received. Stopping after current step...\n");
     keep_running = 0;
 }
 
@@ -311,16 +325,30 @@ int main(int argc, char *argv[]) {
     printf("  Layers: %d\n", N_LAYERS);
     printf("  Seq Len: %d\n", SEQ_LEN);
     printf("  Update Threshold: %d\n\n", UPDATE_THRESHOLD);
+    fflush(stdout);
 
     // Load dataset
+    printf("Loading dataset...\n");
+    fflush(stdout);
     Dataset ds = load_dataset("input.txt");
+    printf("Dataset loaded: %ld bytes\n", ds.length);
+    fflush(stdout);
 
     // Initialize model
-    EggModel model;
-    init_model(&model);
+    printf("Initializing model...\n");
+    fflush(stdout);
+    EggModel *model = (EggModel*)malloc(sizeof(EggModel));
+    if (!model) {
+        fprintf(stderr, "Error: Could not allocate model\n");
+        exit(1);
+    }
+    init_model(model);
     printf("Model initialized\n");
+    fflush(stdout);
 
     // Training state
+    printf("Allocating fitness arrays...\n");
+    fflush(stdout);
     int *pair_fitnesses = (int*)malloc((POPULATION_SIZE / 2) * sizeof(int));
     int *population_losses = (int*)malloc(POPULATION_SIZE * sizeof(int));
 
@@ -328,6 +356,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Could not allocate fitness arrays\n");
         exit(1);
     }
+    printf("Fitness arrays allocated\n");
+    fflush(stdout);
 
     // Training loop
     const int max_steps = (ds.length / SEQ_LEN) - 10;
@@ -341,7 +371,7 @@ int main(int argc, char *argv[]) {
 
         // Evaluate population
         bool gpu_success = evaluate_population_optimized(
-            &model, &ds, start_idx, pair_fitnesses,
+            model, &ds, start_idx, pair_fitnesses,
             step_seed, population_losses
         );
 
@@ -363,35 +393,35 @@ int main(int argc, char *argv[]) {
 
             // GRU weights
             for (int g = 0; g < 4; g++) {
-                update_matrix(model.gru_weights[l][g], HIDDEN_DIM, HIDDEN_DIM,
+                update_matrix(model->gru_weights[l][g], HIDDEN_DIM, HIDDEN_DIM,
                              layer_seed + g + 1, pair_fitnesses, POPULATION_SIZE / 2);
             }
 
             // GRU biases
-            update_matrix(model.gru_biases[l][0], 1, HIDDEN_DIM,
+            update_matrix(model->gru_biases[l][0], 1, HIDDEN_DIM,
                          layer_seed + 7, pair_fitnesses, POPULATION_SIZE / 2);
-            update_matrix(model.gru_biases[l][1], 1, HIDDEN_DIM,
+            update_matrix(model->gru_biases[l][1], 1, HIDDEN_DIM,
                          layer_seed + 8, pair_fitnesses, POPULATION_SIZE / 2);
 
             // MLP weights
-            update_matrix(model.mlp_weights[l][0], HIDDEN_DIM * 4, HIDDEN_DIM,
+            update_matrix(model->mlp_weights[l][0], HIDDEN_DIM * 4, HIDDEN_DIM,
                          layer_seed + 5, pair_fitnesses, POPULATION_SIZE / 2);
-            update_matrix(model.mlp_weights[l][1], HIDDEN_DIM, HIDDEN_DIM * 4,
+            update_matrix(model->mlp_weights[l][1], HIDDEN_DIM, HIDDEN_DIM * 4,
                          layer_seed + 6, pair_fitnesses, POPULATION_SIZE / 2);
 
             // Layer norm weights
-            update_matrix(model.ln_weights[l][0], 1, HIDDEN_DIM,
+            update_matrix(model->ln_weights[l][0], 1, HIDDEN_DIM,
                          layer_seed + 9, pair_fitnesses, POPULATION_SIZE / 2);
-            update_matrix(model.ln_weights[l][1], 1, HIDDEN_DIM,
+            update_matrix(model->ln_weights[l][1], 1, HIDDEN_DIM,
                          layer_seed + 10, pair_fitnesses, POPULATION_SIZE / 2);
         }
 
         // Head
-        update_matrix(model.head, VOCAB_SIZE, HIDDEN_DIM,
+        update_matrix(model->head, VOCAB_SIZE, HIDDEN_DIM,
                      step_seed + 999, pair_fitnesses, POPULATION_SIZE / 2);
 
         // Output layer norm
-        update_matrix(model.ln_out, 1, HIDDEN_DIM,
+        update_matrix(model->ln_out, 1, HIDDEN_DIM,
                      step_seed + 11, pair_fitnesses, POPULATION_SIZE / 2);
 
         // Print progress
@@ -414,6 +444,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     free(ds.data);
+    free(model);
     free(pair_fitnesses);
     free(population_losses);
 
