@@ -3,7 +3,7 @@
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 256
+#  define HIDDEN_DIM 512
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64
@@ -38,12 +38,12 @@
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 #ifndef CHUNK_SIZE
-#   define CHUNK_SIZE (8192 * 2)
+#   define CHUNK_SIZE (8192)
 #endif
 #ifndef POPULATION_BATCH_SIZE
 #   define POPULATION_BATCH_SIZE (CHUNK_SIZE * 1)
 #endif
-#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 16)
+#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 32)
 
 #ifndef FIXED_POINT
 #  define FIXED_POINT 4
