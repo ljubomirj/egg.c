@@ -3,7 +3,7 @@
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 512
+#  define HIDDEN_DIM 1024
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64

@@ -20,6 +20,7 @@
 #include "utils/training.h"
 #include "utils/log.h"
 #include "utils/ternary_pack.h"
+#include "utils/checkpoint.h"
 
 // Constants
 #define PORT 12345
@@ -30,6 +31,9 @@
 // Network Stats (global atomics)
 std::atomic<uint64_t> g_bytes_sent(0);
 std::atomic<uint64_t> g_bytes_received(0);
+
+// Global Configuration
+std::string g_save_dir = "";
 
 // Global State
 struct GlobalState {
@@ -397,6 +401,9 @@ void handle_client(int sock) {
                         // Advance
                         g_state.current_step++;
                         g_state.current_seed = hash_rng(g_state.current_seed, g_state.current_step); // Simple evolution
+
+                        // Save Checkpoint
+                        trigger_save_checkpoint(g_save_dir, g_state.current_step, g_state.current_seed, packed_fit);
                         
                         // Reset for next step
                         int total_chunks = POPULATION_SIZE / CHUNK_SIZE;
@@ -428,6 +435,17 @@ void handle_client(int sock) {
 }
 
 int main(int argc, char** argv) {
+    // Parse Arguments
+    std::string load_dir = "";
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--save-dir" && i + 1 < argc) {
+            g_save_dir = argv[++i];
+        } else if (arg == "--load-dir" && i + 1 < argc) {
+            load_dir = argv[++i];
+        }
+    }
+
     // Register signal handlers for graceful shutdown
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -441,6 +459,20 @@ int main(int argc, char** argv) {
     g_state.chunks_remaining = total_chunks;
     for(int i=0; i<total_chunks; i++) g_state.chunk_queue.push_back(i);
     
+    // Load Checkpoint if requested
+    if (!load_dir.empty()) {
+        std::vector<uint8_t> loaded_fit;
+        if (load_checkpoint(load_dir, g_state.current_step, g_state.current_seed, loaded_fit)) {
+            // Restore history
+            // The checkpoint contains the fitness result of the PREVIOUS step (step-1).
+            // We are now at `step`.
+            // We need to store `loaded_fit` into `fitness_history[step-1]`.
+            if (g_state.current_step > 0) {
+                g_state.fitness_history[g_state.current_step - 1] = loaded_fit;
+            }
+        }
+    }
+
     // Initialize remote logging
     EggLogConfig log_config = {};
     log_config.num_gpus = 0;  // Coordinator doesn't know GPU count
