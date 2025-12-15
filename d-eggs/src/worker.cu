@@ -158,6 +158,61 @@ bool recv_exact(int sock, void* buf, uint32_t len) {
     return true;
 }
 
+// Host-side struct to hold device pointers (avoids touching d_model pointer on host)
+// Helper: Check Pointer Attributes
+void check_pointer(void* ptr, const char* name) {
+    cudaPointerAttributes attr;
+    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        printf("[Memory] %s: Invalid pointer (Error: %s)\n", name, cudaGetErrorString(err));
+    } else {
+        printf("[Memory] %s: Type=%d (2=Device, 1=Host, 3=Managed), Device=%d, HostPtr=%p\n", 
+               name, attr.type, attr.device, attr.hostPointer);
+    }
+}
+
+struct TransformerModelPointers {
+    WeightType* embedding;
+    WeightType* emb_bias;
+    
+#if NTT_MODE != 0
+    WeightType* ntt_emb1;
+    WeightType* ntt_emb2;
+    WeightType* ntt_emb3;
+#endif
+
+    WeightType* ln_init;
+    WeightType* ln_init_bias;
+    WeightType* w_emb_mlp_up;
+    WeightType* mlp_emb_bias_up;
+    WeightType* w_emb_mlp_down;
+    WeightType* mlp_emb_bias_down;
+
+    WeightType* ln_1[N_LAYERS];
+    WeightType* ln_1_bias[N_LAYERS];
+    WeightType* w_q[N_LAYERS];
+    WeightType* w_k[N_LAYERS];
+    WeightType* w_v[N_LAYERS];
+    WeightType* w_o[N_LAYERS];
+    WeightType* ln_2[N_LAYERS];
+    WeightType* ln_2_bias[N_LAYERS];
+    WeightType* w_up[N_LAYERS];
+    WeightType* mlp_bias_up[N_LAYERS];
+    WeightType* w_down[N_LAYERS];
+    WeightType* mlp_bias_down[N_LAYERS];
+    
+    WeightType* ln_f;
+    WeightType* ln_f_bias;
+};
+
+// Helper: Allocate Managed Memory with Residency
+void allocate_managed(void** ptr, size_t size, int device_id) {
+    cudaMallocManaged(ptr, size);
+    cudaMemAdvise(*ptr, size, cudaMemAdviseSetPreferredLocation, device_id);
+    cudaMemAdvise(*ptr, size, cudaMemAdviseSetAccessedBy, device_id);
+    cudaMemPrefetchAsync(*ptr, size, device_id, 0);
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <server_ip>" << std::endl;
@@ -177,6 +232,9 @@ int main(int argc, char** argv) {
     printf("==============================\n\n");
 
     // 1. Init CUDA & Model
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    
     init_tables();
     copy_tables_to_device();
     
@@ -186,11 +244,50 @@ int main(int argc, char** argv) {
     
     TransformerModel *d_model;
     AdamModel *d_adam_state;
-    cudaMalloc(&d_model, sizeof(TransformerModel));
-    cudaMalloc(&d_adam_state, sizeof(AdamModel));
+    allocate_managed((void**)&d_model, sizeof(TransformerModel), device_id);
+    allocate_managed((void**)&d_adam_state, sizeof(AdamModel), device_id);
     cudaMemcpy(d_model, h_model, sizeof(TransformerModel), cudaMemcpyHostToDevice);
     cudaMemcpy(d_adam_state, h_adam_state, sizeof(AdamModel), cudaMemcpyHostToDevice);
     
+    free(h_model);
+    free(h_adam_state);
+
+    check_pointer(d_model, "d_model");
+    check_pointer(d_adam_state, "d_adam_state");
+
+    // Cache device pointers to avoid touching d_model on host
+    TransformerModelPointers d_ptrs;
+    d_ptrs.embedding = d_model->embedding;
+    d_ptrs.emb_bias = d_model->emb_bias;
+#if NTT_MODE != 0
+    d_ptrs.ntt_emb1 = d_model->ntt_emb1;
+    d_ptrs.ntt_emb2 = d_model->ntt_emb2;
+    d_ptrs.ntt_emb3 = d_model->ntt_emb3;
+#endif
+    d_ptrs.ln_init = d_model->ln_init;
+    d_ptrs.ln_init_bias = d_model->ln_init_bias;
+    d_ptrs.w_emb_mlp_up = d_model->w_emb_mlp_up;
+    d_ptrs.mlp_emb_bias_up = d_model->mlp_emb_bias_up;
+    d_ptrs.w_emb_mlp_down = d_model->w_emb_mlp_down;
+    d_ptrs.mlp_emb_bias_down = d_model->mlp_emb_bias_down;
+    
+    for(int l=0; l<N_LAYERS; l++) {
+        d_ptrs.ln_1[l] = d_model->ln_1[l];
+        d_ptrs.ln_1_bias[l] = d_model->ln_1_bias[l];
+        d_ptrs.w_q[l] = d_model->w_q[l];
+        d_ptrs.w_k[l] = d_model->w_k[l];
+        d_ptrs.w_v[l] = d_model->w_v[l];
+        d_ptrs.w_o[l] = d_model->w_o[l];
+        d_ptrs.ln_2[l] = d_model->ln_2[l];
+        d_ptrs.ln_2_bias[l] = d_model->ln_2_bias[l];
+        d_ptrs.w_up[l] = d_model->w_up[l];
+        d_ptrs.mlp_bias_up[l] = d_model->mlp_bias_up[l];
+        d_ptrs.w_down[l] = d_model->w_down[l];
+        d_ptrs.mlp_bias_down[l] = d_model->mlp_bias_down[l];
+    }
+    d_ptrs.ln_f = d_model->ln_f;
+    d_ptrs.ln_f_bias = d_model->ln_f_bias;
+
     // Load Dataset
     FILE *f = fopen("input.bin", "rb"); // Assume input.bin exists
     if(!f) { std::cerr << "No input.bin" << std::endl; return 1; }
@@ -203,8 +300,11 @@ int main(int argc, char** argv) {
     fclose(f);
     
     TokenType *d_dataset;
-    cudaMalloc(&d_dataset, file_size);
+    allocate_managed((void**)&d_dataset, file_size, device_id);
     cudaMemcpy(d_dataset, h_ds, file_size, cudaMemcpyHostToDevice);
+    free(h_ds);
+
+    check_pointer(d_dataset, "d_dataset");
     
 #if USE_TOKENIZER
     // Load vocabulary for detokenization
@@ -215,18 +315,21 @@ int main(int argc, char** argv) {
 #endif
     
     // Buffers
-    int32_t *d_loss; cudaMalloc(&d_loss, POPULATION_SIZE * sizeof(int32_t)); // Max size
-    int32_t *d_fit; cudaMalloc(&d_fit, (POPULATION_SIZE/2) * sizeof(int32_t));
+    int32_t *d_loss; allocate_managed((void**)&d_loss, POPULATION_SIZE * sizeof(int32_t), device_id); // Max size
+    int32_t *d_fit; allocate_managed((void**)&d_fit, (POPULATION_SIZE/2) * sizeof(int32_t), device_id);
     ActType *d_kv_cache; 
     size_t kv_size = (size_t)POPULATION_BATCH_SIZE * N_LAYERS * 2 * SEQ_LEN * HIDDEN_DIM; // Approx
-    cudaMalloc(&d_kv_cache, kv_size); // Need to ensure enough for chunk size
+    allocate_managed((void**)&d_kv_cache, kv_size, device_id); // Need to ensure enough for chunk size
     
+    check_pointer(d_kv_cache, "d_kv_cache");
+    printf("[Memory] d_kv_cache size: %.2f GB\n", (double)kv_size / (1024.0*1024.0*1024.0));
+
     // Generation buffers
     int gen_seed_len = 32;
     int gen_output_len = 64; 
     int total_gen_len = gen_seed_len + gen_output_len;
-    TokenType *d_gen_buf; cudaMalloc(&d_gen_buf, total_gen_len * sizeof(TokenType));
-    ActType *d_gen_kv; cudaMalloc(&d_gen_kv, N_LAYERS * 2 * total_gen_len * HIDDEN_DIM);
+    TokenType *d_gen_buf; allocate_managed((void**)&d_gen_buf, total_gen_len * sizeof(TokenType), device_id);
+    ActType *d_gen_kv; allocate_managed((void**)&d_gen_kv, N_LAYERS * 2 * total_gen_len * HIDDEN_DIM, device_id);
 
     uint64_t current_step = 0;
     uint64_t current_seed = 42;
@@ -301,40 +404,40 @@ int main(int argc, char** argv) {
 
                 for(int l=0; l<N_LAYERS; l++) {
                     int s_base = l * 1000;
-                    LAUNCH_ADAM_MATRIX(d_model->w_q[l], d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base);
-                    LAUNCH_ADAM_MATRIX(d_model->w_k[l], d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base);
-                    LAUNCH_ADAM_MATRIX(d_model->w_v[l], d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base);
-                    LAUNCH_ADAM_MATRIX(d_model->w_o[l], d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base);
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_q[l], d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base);
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_k[l], d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base);
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_v[l], d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base);
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_o[l], d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base);
                     
-                    LAUNCH_ADAM_MATRIX(d_model->w_up[l], d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base);
-                    LAUNCH_ADAM_MATRIX(d_model->w_down[l], d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base);
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_up[l], d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base);
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_down[l], d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base);
                     
-                    LAUNCH_ADAM_VECTOR(d_model->ln_1[l], d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1_A, SEED_OFF_LN_1_B, s_base, 1.0f);
-                    LAUNCH_ADAM_VECTOR(d_model->ln_1_bias[l], d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS_A, SEED_OFF_LN_1_BIAS_B, s_base, 1.0f);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_1[l], d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1_A, SEED_OFF_LN_1_B, s_base, 1.0f);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_1_bias[l], d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS_A, SEED_OFF_LN_1_BIAS_B, s_base, 1.0f);
                     
-                    LAUNCH_ADAM_VECTOR(d_model->ln_2[l], d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2_A, SEED_OFF_LN_2_B, s_base, 1.0f);
-                    LAUNCH_ADAM_VECTOR(d_model->ln_2_bias[l], d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS_A, SEED_OFF_LN_2_BIAS_B, s_base, 1.0f);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_2[l], d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2_A, SEED_OFF_LN_2_B, s_base, 1.0f);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_2_bias[l], d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS_A, SEED_OFF_LN_2_BIAS_B, s_base, 1.0f);
                     
-                    LAUNCH_ADAM_VECTOR(d_model->mlp_bias_up[l], d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP_A, SEED_OFF_MLP_BIAS_UP_B, s_base, 1.0f);
-                    LAUNCH_ADAM_VECTOR(d_model->mlp_bias_down[l], d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN_A, SEED_OFF_MLP_BIAS_DOWN_B, s_base, 1.0f);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_up[l], d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP_A, SEED_OFF_MLP_BIAS_UP_B, s_base, 1.0f);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_down[l], d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN_A, SEED_OFF_MLP_BIAS_DOWN_B, s_base, 1.0f);
                 }
                 
-                LAUNCH_ADAM_VECTOR(d_model->ln_f, d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, 0, 1.0f);
-                LAUNCH_ADAM_VECTOR(d_model->ln_f_bias, d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, 0, 1.0f);
+                LAUNCH_ADAM_VECTOR(d_ptrs.ln_f, d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, 0, 1.0f);
+                LAUNCH_ADAM_VECTOR(d_ptrs.ln_f_bias, d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, 0, 1.0f);
                 
-                LAUNCH_ADAM_VECTOR(d_model->ln_init, d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT_A, SEED_OFF_LN_INIT_B, 0, 1.0f);
-                LAUNCH_ADAM_VECTOR(d_model->ln_init_bias, d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS_A, SEED_OFF_LN_INIT_BIAS_B, 0, 1.0f);
+                LAUNCH_ADAM_VECTOR(d_ptrs.ln_init, d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT_A, SEED_OFF_LN_INIT_B, 0, 1.0f);
+                LAUNCH_ADAM_VECTOR(d_ptrs.ln_init_bias, d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS_A, SEED_OFF_LN_INIT_BIAS_B, 0, 1.0f);
 
-                LAUNCH_ADAM_MATRIX(d_model->w_emb_mlp_up, d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0);
-                LAUNCH_ADAM_VECTOR(d_model->mlp_emb_bias_up, d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP_A, SEED_OFF_EMB_MLP_BIAS_UP_B, 0, 1.0f);
+                LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_up, d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0);
+                LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_up, d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP_A, SEED_OFF_EMB_MLP_BIAS_UP_B, 0, 1.0f);
 
-                LAUNCH_ADAM_MATRIX(d_model->w_emb_mlp_down, d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0);
-                LAUNCH_ADAM_VECTOR(d_model->mlp_emb_bias_down, d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B, 0, 1.0f);
+                LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_down, d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0);
+                LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_down, d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B, 0, 1.0f);
 
-                LAUNCH_ADAM_VECTOR(d_model->emb_bias, d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS_A, SEED_OFF_EMB_BIAS_B, 0, 0.1f);
+                LAUNCH_ADAM_VECTOR(d_ptrs.emb_bias, d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS_A, SEED_OFF_EMB_BIAS_B, 0, 0.1f);
                 
                 update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512 >>>(
-                    (WeightType*)d_model->embedding, 
+                    (WeightType*)d_ptrs.embedding, 
                     (AdamParam*)d_adam_state->embedding, 
                     HIDDEN_DIM, VOCAB_SIZE, 
                     SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 
