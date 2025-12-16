@@ -36,6 +36,9 @@ The system follows a **Coordinator-Worker** model designed for high throughput a
     *   **Adaptive Noise Scaling**: Automatically adjusts noise scale per layer/parameter to maintain stability.
     *   **Chunk Mean Filter**: Favors perturbations that align with the local chunk trend.
     *   **Adaptive Thresholding**: Filters out weak signals based on mean absolute difference.
+*   **Optimizers**:
+    *   **AdamW**: Implements the AdamW optimizer (`d-eggs/include/optimizer/adam.cuh`) with quantized updates, maintaining float moments while updating integer weights.
+    *   **SGD / Quantized Update**: Uses a threshold-based update mechanism (`d-eggs/include/optimizer/sgd.cuh`) to bridge floating-point gradients with integer-only weights.
 
 ## Experimental Features (Disabled by Default)
 
@@ -101,4 +104,3 @@ Configuration is handled via `include/config.h`. Key parameters include:
 *   `USE_MUON`, `ROPE_SCALE_BIT`: Advanced features.
 
 Recompile after changing `config.h`.
-
