@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <cuda_runtime.h>
 #include <csignal>
+#include <cmath>
 
 #include "../include/protocol.h"
 #include "../include/config.h"
@@ -232,6 +233,7 @@ int main(int argc, char** argv) {
     printf("  Heads:      %d\n", N_HEADS);
     printf("  Seq Len:    %d\n", SEQ_LEN);
     printf("  Vocab Size: %d\n", VOCAB_SIZE);
+    printf("  Chunk Mean Filter: %d (Exp: %.2f)\n", CHUNK_MEAN_FILTER, (double)CHUNK_MEAN_EXPONENT);
     printf("Connecting to Coordinator at %s:%d...\n", server_ip, port);
     printf("==============================\n\n");
 
@@ -325,6 +327,17 @@ int main(int argc, char** argv) {
     int32_t *d_loss; allocate_managed((void**)&d_loss, POPULATION_SIZE * sizeof(int32_t), device_id); // Max size
     int32_t *d_fit; allocate_managed((void**)&d_fit, (POPULATION_SIZE/2) * sizeof(int32_t), device_id);
     
+    // Adaptive Noise Scales
+    AdaptiveScales *d_scales;
+    allocate_managed((void**)&d_scales, sizeof(AdaptiveScales), device_id);
+    cudaMemset(d_scales, ADAPTIVE_NOISE_INIT, sizeof(AdaptiveScales)); // Init to 64
+
+    // Accumulators for Adaptive Noise
+    // Ensure buffers are large enough for the largest dimensions (Vocab or 4*Hidden)
+    size_t max_dim = (VOCAB_SIZE > 4*HIDDEN_DIM) ? VOCAB_SIZE : 4*HIDDEN_DIM;
+    int *d_row_accum; allocate_managed((void**)&d_row_accum, max_dim * sizeof(int), device_id);
+    int *d_col_accum; allocate_managed((void**)&d_col_accum, max_dim * sizeof(int), device_id);
+
     // Graph Update Params
     uint32_t *d_update_seed; 
     float *d_update_lr;
@@ -429,57 +442,81 @@ int main(int argc, char** argv) {
                     cudaMemsetAsync(ptr_total_updates, 0, sizeof(unsigned long long), update_stream);
 
                     // Run Updates
-                    #define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE) \
+                    #define UPDATE_OVERLAY(ACCUM, OVERLAY, COUNT) \
+                        if (ADAPTIVE_NOISE_MODE > 0) { \
+                            update_overlay_kernel<<< (COUNT+255)/256, 256, 0, update_stream >>>(ACCUM, OVERLAY, COUNT); \
+                        }
+
+                    #define LAUNCH_ADAM_MATRIX(M_PTR, ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, BASE, ROW_OV, COL_OV) \
+                        cudaMemsetAsync(d_row_accum, 0, ROWS * sizeof(int), update_stream); \
+                        cudaMemsetAsync(d_col_accum, 0, COLS * sizeof(int), update_stream); \
                         update_matrix_adam_kernel<<< (ROWS*COLS+511)/512, 512, 0, update_stream >>>( \
                         (WeightType*)M_PTR, (AdamParam*)ADAM_PTR, ROWS, COLS, SEED_A, SEED_B, \
-                        BASE, d_fit, d_update_seed, d_update_lr)
+                        BASE, d_fit, d_update_seed, d_update_lr, d_row_accum, d_col_accum); \
+                        UPDATE_OVERLAY(d_row_accum, ROW_OV, ROWS); \
+                        UPDATE_OVERLAY(d_col_accum, COL_OV, COLS);
 
-                    #define LAUNCH_ADAM_VECTOR(V_PTR, ADAM_PTR, LEN, SEED_A, SEED_B, BASE, LR_PTR) \
+                    #define LAUNCH_ADAM_VECTOR(V_PTR, ADAM_PTR, LEN, SEED_A, SEED_B, BASE, LR_PTR, OV) \
+                        cudaMemsetAsync(d_row_accum, 0, LEN * sizeof(int), update_stream); \
                         update_vector_adam_kernel<<< (LEN+255)/256, 256, 0, update_stream >>>( \
                         (WeightType*)V_PTR, (AdamParam*)ADAM_PTR, LEN, SEED_A, SEED_B, \
-                        BASE, d_fit, d_update_seed, LR_PTR)
+                        BASE, d_fit, d_update_seed, LR_PTR, d_row_accum); \
+                        UPDATE_OVERLAY(d_row_accum, OV, LEN);
 
                     for(int l=0; l<N_LAYERS; l++) {
                         int s_base = l * 1000;
-                        LAUNCH_ADAM_MATRIX(d_ptrs.w_q[l], d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base);
-                        LAUNCH_ADAM_MATRIX(d_ptrs.w_k[l], d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base);
-                        LAUNCH_ADAM_MATRIX(d_ptrs.w_v[l], d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base);
-                        LAUNCH_ADAM_MATRIX(d_ptrs.w_o[l], d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_q[l], d_adam_state->w_q[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_Q_A, SEED_OFF_Q_B, s_base, d_scales->w_q_row[l], d_scales->w_q_col[l]);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_k[l], d_adam_state->w_k[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_K_A, SEED_OFF_K_B, s_base, d_scales->w_k_row[l], d_scales->w_k_col[l]);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_v[l], d_adam_state->w_v[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_V_A, SEED_OFF_V_B, s_base, d_scales->w_v_row[l], d_scales->w_v_col[l]);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_o[l], d_adam_state->w_o[l], HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_O_A, SEED_OFF_O_B, s_base, d_scales->w_o_row[l], d_scales->w_o_col[l]);
                         
-                        LAUNCH_ADAM_MATRIX(d_ptrs.w_up[l], d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base);
-                        LAUNCH_ADAM_MATRIX(d_ptrs.w_down[l], d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_up[l], d_adam_state->w_up[l], HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_MLP_UP_A, SEED_OFF_MLP_UP_B, s_base, d_scales->w_up_row[l], d_scales->w_up_col[l]);
+                        LAUNCH_ADAM_MATRIX(d_ptrs.w_down[l], d_adam_state->w_down[l], 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_MLP_DOWN_A, SEED_OFF_MLP_DOWN_B, s_base, d_scales->w_down_row[l], d_scales->w_down_col[l]);
                         
-                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_1[l], d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1_A, SEED_OFF_LN_1_B, s_base, d_update_lr);
-                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_1_bias[l], d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS_A, SEED_OFF_LN_1_BIAS_B, s_base, d_update_lr);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_1[l], d_adam_state->ln_1[l], HIDDEN_DIM, SEED_OFF_LN_1_A, SEED_OFF_LN_1_B, s_base, d_update_lr, d_scales->ln_1[l]);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_1_bias[l], d_adam_state->ln_1_bias[l], HIDDEN_DIM, SEED_OFF_LN_1_BIAS_A, SEED_OFF_LN_1_BIAS_B, s_base, d_update_lr, d_scales->ln_1_bias[l]);
                         
-                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_2[l], d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2_A, SEED_OFF_LN_2_B, s_base, d_update_lr);
-                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_2_bias[l], d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS_A, SEED_OFF_LN_2_BIAS_B, s_base, d_update_lr);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_2[l], d_adam_state->ln_2[l], HIDDEN_DIM, SEED_OFF_LN_2_A, SEED_OFF_LN_2_B, s_base, d_update_lr, d_scales->ln_2[l]);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.ln_2_bias[l], d_adam_state->ln_2_bias[l], HIDDEN_DIM, SEED_OFF_LN_2_BIAS_A, SEED_OFF_LN_2_BIAS_B, s_base, d_update_lr, d_scales->ln_2_bias[l]);
                         
-                        LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_up[l], d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP_A, SEED_OFF_MLP_BIAS_UP_B, s_base, d_update_lr);
-                        LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_down[l], d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN_A, SEED_OFF_MLP_BIAS_DOWN_B, s_base, d_update_lr);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_up[l], d_adam_state->mlp_bias_up[l], 4*HIDDEN_DIM, SEED_OFF_MLP_BIAS_UP_A, SEED_OFF_MLP_BIAS_UP_B, s_base, d_update_lr, d_scales->mlp_bias_up[l]);
+                        LAUNCH_ADAM_VECTOR(d_ptrs.mlp_bias_down[l], d_adam_state->mlp_bias_down[l], HIDDEN_DIM, SEED_OFF_MLP_BIAS_DOWN_A, SEED_OFF_MLP_BIAS_DOWN_B, s_base, d_update_lr, d_scales->mlp_bias_down[l]);
                     }
                     
-                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_f, d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, 0, d_update_lr);
-                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_f_bias, d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, 0, d_update_lr);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_f, d_adam_state->ln_f, HIDDEN_DIM, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, 0, d_update_lr, d_scales->ln_f);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_f_bias, d_adam_state->ln_f_bias, HIDDEN_DIM, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, 0, d_update_lr, d_scales->ln_f_bias);
                     
-                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_init, d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT_A, SEED_OFF_LN_INIT_B, 0, d_update_lr);
-                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_init_bias, d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS_A, SEED_OFF_LN_INIT_BIAS_B, 0, d_update_lr);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_init, d_adam_state->ln_init, HIDDEN_DIM, SEED_OFF_LN_INIT_A, SEED_OFF_LN_INIT_B, 0, d_update_lr, d_scales->ln_init);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.ln_init_bias, d_adam_state->ln_init_bias, HIDDEN_DIM, SEED_OFF_LN_INIT_BIAS_A, SEED_OFF_LN_INIT_BIAS_B, 0, d_update_lr, d_scales->ln_init_bias);
 
-                    LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_up, d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0);
-                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_up, d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP_A, SEED_OFF_EMB_MLP_BIAS_UP_B, 0, d_update_lr);
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_up, d_adam_state->w_emb_mlp_up, HIDDEN_DIM, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_UP_A, SEED_OFF_EMB_MLP_UP_B, 0, d_scales->w_emb_mlp_up_row, d_scales->w_emb_mlp_up_col);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_up, d_adam_state->mlp_emb_bias_up, 4*HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_UP_A, SEED_OFF_EMB_MLP_BIAS_UP_B, 0, d_update_lr, d_scales->mlp_emb_bias_up);
 
-                    LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_down, d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0);
-                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_down, d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B, 0, d_update_lr);
+                    LAUNCH_ADAM_MATRIX(d_ptrs.w_emb_mlp_down, d_adam_state->w_emb_mlp_down, 4*HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_EMB_MLP_DOWN_A, SEED_OFF_EMB_MLP_DOWN_B, 0, d_scales->w_emb_mlp_down_row, d_scales->w_emb_mlp_down_col);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.mlp_emb_bias_down, d_adam_state->mlp_emb_bias_down, HIDDEN_DIM, SEED_OFF_EMB_MLP_BIAS_DOWN_A, SEED_OFF_EMB_MLP_BIAS_DOWN_B, 0, d_update_lr, d_scales->mlp_emb_bias_down);
 
-                    LAUNCH_ADAM_VECTOR(d_ptrs.emb_bias, d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS_A, SEED_OFF_EMB_BIAS_B, 0, d_update_lr_bias);
+                    LAUNCH_ADAM_VECTOR(d_ptrs.emb_bias, d_adam_state->emb_bias, HIDDEN_DIM, SEED_OFF_EMB_BIAS_A, SEED_OFF_EMB_BIAS_B, 0, d_update_lr_bias, d_scales->emb_bias);
                     
+                    cudaMemsetAsync(d_row_accum, 0, VOCAB_SIZE * sizeof(int), update_stream);
+                    cudaMemsetAsync(d_col_accum, 0, HIDDEN_DIM * sizeof(int), update_stream);
                     update_matrix_adam_kernel<<< (HIDDEN_DIM*VOCAB_SIZE+511)/512, 512, 0, update_stream >>>(
                         (WeightType*)d_ptrs.embedding, 
                         (AdamParam*)d_adam_state->embedding, 
                         HIDDEN_DIM, VOCAB_SIZE, 
                         SEED_OFF_EMB, SEED_OFF_EMB+HIDDEN_DIM, 
-                        0, d_fit, d_update_seed, d_update_lr
+                        0, d_fit, d_update_seed, d_update_lr,
+                        d_col_accum, d_row_accum // Note: Embedding is [HIDDEN, VOCAB]. Row=Hidden, Col=Vocab.
+                        // Wait, repack_matrix packs it as [HIDDEN, VOCAB].
+                        // So ROWS=HIDDEN, COLS=VOCAB.
+                        // So d_row_accum (size VOCAB) is too small for ROWS? No, ROWS=HIDDEN (256).
+                        // d_col_accum (size 4*HIDDEN) is too small for COLS (VOCAB=8192).
+                        // I allocated d_row_accum as VOCAB_SIZE.
+                        // So I should use d_row_accum for COLS (Vocab) and d_col_accum for ROWS (Hidden).
+                        // But update_matrix_adam_kernel expects (row_accum, col_accum).
+                        // So I pass (d_col_accum, d_row_accum).
                     );
+                    UPDATE_OVERLAY(d_col_accum, d_scales->embedding_col, HIDDEN_DIM);
+                    UPDATE_OVERLAY(d_row_accum, d_scales->embedding_row, VOCAB_SIZE);
                     
                     cudaStreamEndCapture(update_stream, &update_graph);
                     cudaGraphInstantiate(&update_instance, update_graph, NULL, NULL, 0);
@@ -588,7 +625,7 @@ int main(int argc, char** argv) {
             
             train_sequence_kernel<<<count, EGG_BLOCK_THREADS, sm_size>>>(
                 d_dataset, ds_len, current_step*SEQ_LEN, d_model, d_kv_cache, 
-                d_loss, current_seed, global_pop_offset, current_step
+                d_loss, current_seed, global_pop_offset, current_step, d_scales
             );
             
             // Copy Result
@@ -598,18 +635,37 @@ int main(int argc, char** argv) {
             // Compute Fitness & Sum Loss
             int64_t sum_loss = 0;
             int num_fitness = count / 2;
-            std::vector<int32_t> h_fit(num_fitness);
-
-#if USE_ADAPTIVE_THRESHOLD
-            // Adaptive Thresholding: Filter out weak signals based on Mean Absolute Difference
-            double sum_abs_diff = 0.0;
             std::vector<int32_t> diffs(num_fitness);
             
+            // First pass: compute diffs and sum_loss
+            double sum_diff_val = 0.0;
             for(int i=0; i<num_fitness; i++) {
                 int32_t p = h_loss[2*i];
                 int32_t n = h_loss[2*i+1];
                 sum_loss += p + n;
                 diffs[i] = n - p; // Positive if p < n (p is better -> +1)
+                sum_diff_val += diffs[i];
+            }
+
+#if CHUNK_MEAN_FILTER
+            double mean_diff = sum_diff_val / num_fitness;
+            
+            if (mean_diff != 0.0) {
+                double sign = (mean_diff > 0) ? 1.0 : -1.0;
+                mean_diff = sign * std::pow(std::abs(mean_diff), (double)CHUNK_MEAN_EXPONENT);
+            }
+
+            for(int i=0; i<num_fitness; i++) {
+                diffs[i] += (int32_t)mean_diff;
+            }
+#endif
+
+            std::vector<int32_t> h_fit(num_fitness);
+
+#if USE_ADAPTIVE_THRESHOLD
+            // Adaptive Thresholding: Filter out weak signals based on Mean Absolute Difference
+            double sum_abs_diff = 0.0;
+            for(int i=0; i<num_fitness; i++) {
                 sum_abs_diff += std::abs((double)diffs[i]);
             }
             
@@ -626,10 +682,7 @@ int main(int argc, char** argv) {
 #else
             // Original Pairwise Comparison
             for(int i=0; i<num_fitness; i++) {
-                int32_t p = h_loss[2*i];
-                int32_t n = h_loss[2*i+1];
-                sum_loss += p + n;
-                h_fit[i] = (p < n) ? 1 : ((n < p) ? -1 : 0);
+                h_fit[i] = (diffs[i] > 0) ? 1 : ((diffs[i] < 0) ? -1 : 0);
             }
 #endif
             

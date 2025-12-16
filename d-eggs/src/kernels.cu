@@ -58,6 +58,24 @@ void copy_tables_to_device() {
     cudaMemcpyToSymbol(d_ROPE_LUT, h_ROPE_LUT, ROPE_LUT_SIZE*sizeof(int32_t));
 }
 
+__global__ void update_overlay_kernel(int *accum, WeightType *overlay, int count) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < count) {
+        int changes = accum[idx];
+        accum[idx] = 0; // Reset
+        
+        int ov = overlay[idx];
+        if (changes > 0) {
+            ov += ADAPTIVE_NOISE_INC;
+            if (ov > MAX_VAL) ov = MAX_VAL;
+        } else {
+            ov -= ADAPTIVE_NOISE_DEC;
+            if (ov < MIN_VAL) ov = MIN_VAL;
+        }
+        overlay[idx] = (WeightType)ov;
+    }
+}
+
 __device__ __forceinline__ WeightType get_embedding_byte(const WeightType *packed_embedding, int hidden_idx, int token_idx) {
     // Packed layout: [HIDDEN_DIM/4, VOCAB_SIZE] of int32 (4 bytes)
     // Map (hidden_idx, token_idx) to packed layout
@@ -74,7 +92,8 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
     const TransformerModel * __restrict__ model,
     ActType * __restrict__ global_kv_cache,
     int32_t *accum_loss, uint32_t step_seed,
-    int global_pop_offset, long step
+    int global_pop_offset, long step,
+    const AdaptiveScales * __restrict__ scales = nullptr
 ) {
     int p_idx = global_pop_offset + blockIdx.x; 
     // if (p_idx >= POPULATION_SIZE) return; // Handled by caller logic usually, but good safety
@@ -119,14 +138,23 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         WeightType emb = get_embedding_byte(model->embedding, tid, input_token);
         WeightType ebias = model->emb_bias[tid];
         
+        float s_emb_b = 1.0f;
+        if (scales) s_emb_b = get_adaptive_factor(scales->emb_bias[tid], (step_seed + pair_idx) + SEED_OFF_EMB_BIAS_A, tid);
+
         int8_t emb_bias_n1 = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_BIAS_A, tid);
         int8_t emb_bias_n2 = noise_from_hash((step_seed + pair_idx) + SEED_OFF_EMB_BIAS_B, tid);
-        AccumType emb_bias_chk = ((AccumType)emb_bias_n1 * emb_bias_n2 * ns) >> SIGMA_SHIFT_VECTOR;
+        AccumType emb_bias_chk = ((AccumType)(emb_bias_n1 * emb_bias_n2 * s_emb_b) * ns) >> SIGMA_SHIFT_VECTOR;
         
+        float s_emb_row = 1.0f, s_emb_col = 1.0f;
+        if (scales) {
+            s_emb_row = get_adaptive_factor(scales->embedding_row[input_token], seed_emb, input_token);
+            s_emb_col = get_adaptive_factor(scales->embedding_col[tid], seed_emb + HIDDEN_DIM, tid);
+        }
+
         // RoPE: Absolute pos emb removed
         int8_t a_tok = noise_from_hash(seed_emb, input_token);
         int8_t b_dim = noise_from_hash(seed_emb + HIDDEN_DIM, tid);
-        AccumType perturb = ((AccumType)a_tok * b_dim * ns) >> (FIXED_POINT + SIGMA_SHIFT);
+        AccumType perturb = ((AccumType)(a_tok * b_dim * s_emb_row * s_emb_col) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
 
 #if NTT_MODE != 0
         // NTT coefficient embedding: decompose int32 NTT coeff into 4 bytes
@@ -146,7 +174,7 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         __syncthreads();
         EGG_TRACE_STAT(step, t, -1, "Emb", s_x, HIDDEN_DIM);
 
-        compute_mlp(0, t, tid, s_x, s_mem, temp_storage, shared_scalar, model->ln_init, model->ln_init_bias, model->w_emb_mlp_up, model->mlp_emb_bias_up, model->w_emb_mlp_down, model->mlp_emb_bias_down, step_seed + pair_idx, ns, step, global_pop_offset, CFG_MLP_INIT);
+        compute_mlp(0, t, tid, s_x, s_mem, temp_storage, shared_scalar, model->ln_init, model->ln_init_bias, model->w_emb_mlp_up, model->mlp_emb_bias_up, model->w_emb_mlp_down, model->mlp_emb_bias_down, step_seed + pair_idx, ns, step, global_pop_offset, CFG_MLP_INIT, scales);
 
         // 2. Stack
         for (int l = 0; l < N_LAYERS; l++) {
@@ -162,22 +190,42 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
                 s_x, s_mem, 
                 temp_storage, shared_scalar,
                 seed_base, ns, step,
-                global_pop_offset
+                global_pop_offset,
+                scales
             );
         }
 
         // 3. Final Head
+        float s_ln_f = 1.0f, s_ln_f_b = 1.0f;
+        if (scales) {
+            s_ln_f = get_adaptive_factor(scales->ln_f[tid], (step_seed + pair_idx) + SEED_OFF_LN_F_A, tid);
+            s_ln_f_b = get_adaptive_factor(scales->ln_f_bias[tid], (step_seed + pair_idx) + SEED_OFF_LN_F_BIAS_A, tid);
+        }
+
         ActType nf = apply_standard_norm(
             s_x[tid], tid, temp_storage, shared_scalar,
             model->ln_f[tid], model->ln_f_bias[tid],
-            step_seed + pair_idx, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, ns
+            step_seed + pair_idx, SEED_OFF_LN_F_A, SEED_OFF_LN_F_B, SEED_OFF_LN_F_BIAS_A, SEED_OFF_LN_F_BIAS_B, ns,
+            s_ln_f, s_ln_f_b
         );
         
         // Reuse s_mem[HD] for normed
         ActType *s_norm = &s_mem[HIDDEN_DIM];
         s_norm[tid] = nf; __syncthreads();
         
-        AccumType sbh = block_reduce_sum_broadcast((AccumType)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_EMB + HIDDEN_DIM, tid), temp_storage, shared_scalar);
+        // Head Projection (using embedding weights transposed)
+        // We don't have explicit head weights, we use embedding weights.
+        // So we should use embedding scales?
+        // Yes, embedding_col corresponds to output dim of embedding (HIDDEN_DIM).
+        // Here we project FROM hidden TO vocab.
+        // So input is HIDDEN_DIM. Output is VOCAB.
+        // Weights are [HIDDEN, VOCAB] (transposed embedding).
+        // So we use embedding_col for input scaling, embedding_row for output scaling.
+        
+        float s_head_in = 1.0f;
+        if (scales) s_head_in = get_adaptive_factor(scales->embedding_col[tid], step_seed + pair_idx + SEED_OFF_EMB + HIDDEN_DIM, tid);
+
+        AccumType sbh = block_reduce_sum_broadcast((AccumType)nf * noise_from_hash(step_seed + pair_idx + SEED_OFF_EMB + HIDDEN_DIM, tid) * s_head_in, temp_storage, shared_scalar);
 
         // --- Two-Pass Softmax (Loop-based for Large Vocab) ---
         
@@ -187,7 +235,10 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         int32_t *v_ptr_h = (int32_t*)s_norm;
         
         for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
-            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns);
+            float s_head_out = 1.0f;
+            if (scales) s_head_out = get_adaptive_factor(scales->embedding_row[v], step_seed + pair_idx + SEED_OFF_EMB, v);
+            
+            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns, s_head_out);
             int32_t lgt = ah >> SHIFT_LOGIT;
             if (lgt > local_max) local_max = lgt;
         }
@@ -208,7 +259,10 @@ __global__ void __launch_bounds__(MAX_BLOCK_THREADS) train_sequence_kernel(
         TokenType target_token = dataset[stream_pos + t + 1];
         
         for (int v = tid; v < VOCAB_SIZE; v += blockDim.x) {
-            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns);
+            float s_head_out = 1.0f;
+            if (scales) s_head_out = get_adaptive_factor(scales->embedding_row[v], step_seed + pair_idx + SEED_OFF_EMB, v);
+
+            AccumType ah = compute_linear_projection(v_ptr_h, wh_p, HIDDEN_DIM/4, VOCAB_SIZE, v, sbh, step_seed + pair_idx + SEED_OFF_EMB, ns, s_head_out);
             int32_t lgt = ah >> SHIFT_LOGIT;
             
             int32_t shifted = lgt - global_max;

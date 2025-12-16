@@ -36,7 +36,9 @@ __global__ void update_matrix_adam_kernel(
     int seed_base, 
     const int32_t *fitnesses, 
     const uint32_t *step_seed,
-    const float *learning_rate
+    const float *learning_rate,
+    int *row_accum = nullptr,
+    int *col_accum = nullptr
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -45,12 +47,13 @@ __global__ void update_matrix_adam_kernel(
     __syncthreads();
 
     int change = 0;
+    int k = 0, tid = 0; // Declare outside for scope access
     if (idx < rows * cols) {
         int byte_off = idx & 3;
         int word_idx = idx >> 2;
-        int tid = word_idx % cols; // Output Dim (c)
+        tid = word_idx % cols; // Output Dim (c)
         int k_chunk = word_idx / cols; 
-        int k = k_chunk * 4 + byte_off; // Input Dim (r)
+        k = k_chunk * 4 + byte_off; // Input Dim (r)
         
         // Approximate Gradient Computation
         VoteType vote = 0;
@@ -71,7 +74,13 @@ __global__ void update_matrix_adam_kernel(
         adam_state[idx] = p;
     }
 
-    if (change) atomicAdd(&s_count, 1);
+    if (change) {
+        atomicAdd(&s_count, 1);
+#if ADAPTIVE_NOISE_MODE > 0
+        if (row_accum) atomicAdd(&row_accum[k], 1);
+        if (col_accum) atomicAdd(&col_accum[tid], 1);
+#endif
+    }
     __syncthreads();
 
     if (threadIdx.x == 0 && s_count > 0) atomicAdd(&d_total_updates, (unsigned long long)s_count);
@@ -86,7 +95,8 @@ __global__ void update_vector_adam_kernel(
     int seed_base, 
     const int32_t *fitnesses, 
     const uint32_t *step_seed,
-    const float *learning_rate
+    const float *learning_rate,
+    int *accum = nullptr
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -115,7 +125,12 @@ __global__ void update_vector_adam_kernel(
         adam_state[idx] = p;
     }
 
-    if (change) atomicAdd(&s_count, 1);
+    if (change) {
+        atomicAdd(&s_count, 1);
+#if ADAPTIVE_NOISE_MODE > 0
+        if (accum) atomicAdd(&accum[idx], 1);
+#endif
+    }
     __syncthreads();
 
     if (threadIdx.x == 0 && s_count > 0) atomicAdd(&d_total_updates, (unsigned long long)s_count);

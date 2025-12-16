@@ -78,6 +78,8 @@ void signal_handler(int sig) {
 }
 
 // Helper: Compute Fitness
+// Now, implemented in worker...!
+/*
 void compute_fitness(const std::vector<int32_t>& losses, std::vector<int32_t>& fitnesses) {
     int count = losses.size() / 2;
     fitnesses.resize(count);
@@ -87,6 +89,7 @@ void compute_fitness(const std::vector<int32_t>& losses, std::vector<int32_t>& f
         fitnesses[i] = (p < n) ? 1 : ((n < p) ? -1 : 0);
     }
 }
+*/
 
 // Helper: Humanize bytes
 std::string humanize_bytes(uint64_t bytes) {
@@ -538,6 +541,7 @@ int main(int argc, char** argv) {
     printf("  Vocab Size: %d\n", VOCAB_SIZE);
     printf("Training Config:\n");
     printf("  Population: %d\n", POPULATION_SIZE);
+    printf("  Chunk Mean Filter: %d (Exp: %.2f)\n", CHUNK_MEAN_FILTER, (double)CHUNK_MEAN_EXPONENT);
     printf("  Chunk Size: %d\n", CHUNK_SIZE);
     printf("  Chunks:     %d\n", total_chunks);
     printf("===================================\n\n");

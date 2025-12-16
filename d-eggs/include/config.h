@@ -3,13 +3,13 @@
 
 // --- CONFIGURATION (all overridable via -D flags) ---
 #ifndef HIDDEN_DIM
-#  define HIDDEN_DIM 1024
+#  define HIDDEN_DIM 256
 #endif
 #ifndef HEAD_DIM
 #  define HEAD_DIM 64
 #endif
 #ifndef N_LAYERS
-#  define N_LAYERS 12
+#  define N_LAYERS 4
 #endif
 #ifndef SEQ_LEN
 #  define SEQ_LEN 64
@@ -38,12 +38,12 @@
 #define N_HEADS (HIDDEN_DIM / HEAD_DIM)
 
 #ifndef CHUNK_SIZE
-#   define CHUNK_SIZE (8192)
+#   define CHUNK_SIZE (8192*5)
 #endif
 #ifndef POPULATION_BATCH_SIZE
 #   define POPULATION_BATCH_SIZE (CHUNK_SIZE * 1)
 #endif
-#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 4)
+#define POPULATION_SIZE (POPULATION_BATCH_SIZE * 8)
 
 #ifndef FIXED_POINT
 #  define FIXED_POINT 4
@@ -214,6 +214,31 @@
 #endif
 #ifndef ADAPTIVE_THRESHOLD_ALPHA
 #  define ADAPTIVE_THRESHOLD_ALPHA 0.1f
+#endif
+
+// Chunk Mean Filter: Favor perturbations that align with chunk trend
+#ifndef CHUNK_MEAN_FILTER
+#  define CHUNK_MEAN_FILTER 1
+#endif
+#ifndef CHUNK_MEAN_EXPONENT
+#  define CHUNK_MEAN_EXPONENT 1.2
+#endif
+
+// Adaptive Noise (Noise-Trained Layer)
+// 0: Disabled (Scale 1.0), 1: Adaptive Scale, 2: Adaptive Gate
+#ifndef ADAPTIVE_NOISE_MODE
+#  define ADAPTIVE_NOISE_MODE 1
+#endif
+#define SEED_OFF_GATE 100000
+
+#ifndef ADAPTIVE_NOISE_INC
+#  define ADAPTIVE_NOISE_INC 5
+#endif
+#ifndef ADAPTIVE_NOISE_DEC
+#  define ADAPTIVE_NOISE_DEC 1
+#endif
+#ifndef ADAPTIVE_NOISE_INIT
+#  define ADAPTIVE_NOISE_INIT 64
 #endif
 
 #endif // EGG_CONFIG_H
