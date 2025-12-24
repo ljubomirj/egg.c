@@ -1,3 +1,18 @@
 d-eggs/coordinator
 d-eggs/print_arch
 
+*~
+.viminfo
+.gitignore
+.*.sw?
+*.[0-9]*
+.vscode
+build/
+PLAN.md
+README.LJ
+.claude/
+models/
+logs/
+wikitext_*
+input.txt
+input.txt.zst

@@ -19,10 +19,19 @@ https://github.com/ESHyperscale/HyperscaleES
 https://github.com/ESHyperscale/nano-egg
 
 ## Project Structure & Key Files
-- `full_trained_egg.c`: reference single-file CPU implementation (do not modify).
-- `full_trained_egg-cpumulti.c`: portable CPU path with SIMD autodetect; main place for CPU changes.
-- `full_trained_egg-gpumulti.c` + `full_trained_egg-gpu-metal.mm`: GPU entry + Metal backend.
-- `egg_config.h`: hyperparameters; supports tiny debug overrides via `-DEGG_TINY_DEBUG`.
+- `full_trained_egg.c`: original single-file ARM NEON CPU reference (GRU-based RNN).
+- `full_trained_egg-multi.c`: legacy multi-arch CPU (NEON/AVX2/scalar) with in-file config; GRU RNN.
+- `full_trained_egg-cpumulti.c`: portable CPU path with SIMD autodetect and zstd-aware dataset loading; main place for CPU changes.
+- `full_trained_egg-gpumulti.c`: GPU-capable entry point (Metal when enabled) with CPU fallback/parity hooks; GRU RNN.
+- `full_trained_egg-gpu-metal.mm`: Metal backend for gpumulti (kernels, buffers, fused GRU/MLP/head).
+- `full_trained_egg-gpu-optimized.c`: experimental Metal wrapper; uses optimized pair-eval kernels when `EGG_USE_OPTIMIZED_METAL=1`, else CPU.
+- `full_trained_egg-gpu-metal-optimized.mm`: optimized Metal pair-at-a-time implementation (fused GRU; ignores POPULATION_SIZE).
+- `full_cuda_train_egg.cu`: CUDA/HIP GRU RNN training (ES) with Thrust/CUB; HIP shims for AMD.
+- `full_cuda_train_egg_transformer.cu`: CUDA transformer ES trainer with pos embeddings and checkpointing.
+- `full_cuda_train_egg_transformer_adam.cu`: CUDA/HIP transformer with AdamW, RoPE, extra bias/MLP init, checkpoint/resume.
+- `full_cuda_train_transformer_adam_mgpu.cu`: multi-GPU transformer Adam variant with extra compile-time flags (NTT embeddings, tokenizer, logging).
+- `d-eggs/`: distributed transformer training (coordinator/worker), custom protocol, chunked population, ternary packing; has its own `Makefile` and `include/config.h`.
+- `egg_config.h`: hyperparameters for the C GRU CPU/GPU paths; supports tiny debug overrides via `-DEGG_TINY_DEBUG`.
 - Binaries live in repo root; build suffix indicates configuration (see below).
 
 ## Build, Run, and Debug
@@ -87,6 +96,13 @@ make egg-gpu-macos-metal      # Metal backend (macOS ARM64)
 make egg-gpu-linux-rocm       # ROCm stub (AMD GPU, Linux)
 make egg-gpu-linux-cuda       # CUDA stub (NVIDIA GPU, Linux)
 make egg-gpu-linux-vulcan     # Vulkan stub (cross-platform)
+make egg-train-gpu-linux-rocm # HIP/ROCm GRU trainer (full_cuda_train_egg.cu)
+make egg-train-transformer-gpu-linux-rocm # HIP/ROCm transformer Adam trainer
+```
+
+**Distributed (`d-eggs`) targets:**
+```bash
+make -C d-eggs                # coordinator, worker, print_arch
 ```
 
 **Cleanup:**
@@ -102,10 +118,17 @@ make clean                     # Remove all binaries and intermediate objects
 ./egg-gpu-macos-metal.debug    # Metal GPU (currently slower than CPU), buggy
 ```
 
+**Distributed (`d-eggs`) training:**
+```bash
+./d-eggs/coordinator --save-dir ./checkpoints
+./d-eggs/worker 127.0.0.1
+```
+
 ### Environment Variables
 
 ```bash
 EGG_DISABLE_GPU=1 ./egg-gpu-macos-metal   # Force CPU path even in GPU build
+EGG_USE_OPTIMIZED_METAL=1 ./build/egg-gpu-macos-metal-optimized.debug
 ```
 
 ## Architecture
@@ -113,16 +136,40 @@ EGG_DISABLE_GPU=1 ./egg-gpu-macos-metal   # Force CPU path even in GPU build
 ### Key Components
 
 **Entry Points:**
-- `full_trained_egg.c` - Original reference implementation (macOS only, ARM NEON)
-- `full_trained_egg-cpumulti.c` - Multi-arch CPU implementation with SIMD abstraction
-- `full_trained_egg-gpumulti.c` - GPU multi-platform entry point
-- `full_trained_egg-gpu-metal.mm` - Metal runtime implementation (Objective-C++)
+- `full_trained_egg.c` - Original ARM NEON single-file reference (GRU RNN).
+- `full_trained_egg-multi.c` - Legacy CPU multi-arch (NEON/AVX2/scalar).
+- `full_trained_egg-cpumulti.c` - Current CPU SIMD multi-arch (uses `egg_config.h`).
+- `full_trained_egg-gpumulti.c` - GPU-capable entry (Metal when enabled).
+- `full_trained_egg-gpu-metal.mm` - Metal runtime implementation (Objective-C++).
+- `full_trained_egg-gpu-optimized.c` + `full_trained_egg-gpu-metal-optimized.mm` - Experimental optimized Metal pair-eval path.
+- `full_cuda_train_egg.cu` - CUDA/HIP GRU trainer.
+- `full_cuda_train_egg_transformer.cu` - CUDA transformer ES trainer.
+- `full_cuda_train_egg_transformer_adam.cu` - CUDA/HIP transformer AdamW + RoPE trainer.
+- `full_cuda_train_transformer_adam_mgpu.cu` - Multi-GPU transformer Adam variant.
+- `d-eggs/src/coordinator.cpp` + `d-eggs/src/worker.cu` + `d-eggs/src/kernels.cu` - Distributed transformer training (coordinator/worker).
 
 **Configuration:**
-- `egg_config.h` - Hyperparameters (HIDDEN_DIM, N_LAYERS, SEQ_LEN, POPULATION_SIZE, etc.)
+- `egg_config.h` - Hyperparameters for GRU CPU/GPU paths (HIDDEN_DIM, N_LAYERS, SEQ_LEN, POPULATION_SIZE, etc.).
+- `d-eggs/include/config.h` - Distributed transformer configuration (HIDDEN_DIM, N_LAYERS, POPULATION_SIZE/CHUNK_SIZE, sampling, etc.).
 
 **GPU Headers:**
 - `egg_gpu_metal.h` - Metal C API declarations
+- `egg_gpu_metal_optimized.h` - Optimized Metal pair-eval API used by the experimental path
+
+### Model Variants
+- GRU-based RNN: `full_trained_egg*.c`, `full_trained_egg-gpumulti.c`, `full_cuda_train_egg.cu`.
+- Transformer ES (CUDA): `full_cuda_train_egg_transformer.cu`.
+- Transformer AdamW + RoPE (CUDA/HIP): `full_cuda_train_egg_transformer_adam.cu`.
+- Transformer Adam multi-GPU (CUDA): `full_cuda_train_transformer_adam_mgpu.cu`.
+- Distributed transformer (CUDA): `d-eggs/` (coordinator/worker + kernels).
+- RWKV/RWK.V: no implementation found in current tree; all RNN paths here are GRU.
+
+**GRU RNN Details (baseline egg):**
+- Single gated GRU variant: one gate `ft` drives both reset and update (no separate reset gate).
+- Gate scaling is integer: `gate = (ft + 127) / 256`, then `gated_past = gate * h`.
+- Candidate `ht = W2*x + W3*gated_past + b1`, state update `h = h + gate * (ht - h)`.
+- No explicit sigmoid/tanh; values are clipped to int8 range.
+- Per-layer L1-style layer norm (`sum(abs(x))/HIDDEN_DIM`) before GRU; residual add after GRU; MLP block follows.
 
 ### SIMD Abstraction Layer
 
@@ -157,3 +204,4 @@ The population loop evaluates pairs of perturbations in parallel across availabl
 
 **Memory layout:** Entire dataset resides in RAM; workers index into shared buffer (no further file I/O during training).
 
+**Distributed (`d-eggs`) inputs:** workers expect `input.bin` and `decoding.bin` in their working directory (coordinator does not need them).
