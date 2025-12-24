@@ -1123,7 +1123,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
     typedef cub::WarpReduce<long long> WarpReduce;
     __shared__ typename WarpReduce::TempStorage temp_storage[BLOCK_THREADS / WARP_SIZE];
     __shared__ int32_t head_sum[BLOCK_THREADS / WARP_SIZE][RWKV_N_HEAD];
-    __shared__ long long head_dot[BLOCK_THREADS / WARP_SIZE][RWKV_N_HEAD];
     __shared__ int32_t target_logit_shared[BLOCK_THREADS / WARP_SIZE];
     __shared__ int32_t out_state_shared[BLOCK_THREADS / WARP_SIZE][HIDDEN_DIM];
 
@@ -1371,20 +1370,22 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
             }
             __syncwarp();
 
-            if (lane_id < RWKV_N_HEAD) head_dot[warp_id][lane_id] = 0;
-            __syncwarp();
-            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
-                int head = i / RWKV_HEAD_SIZE;
-                long long contrib = (long long)r[i] * (long long)k[i] * (long long)xv[i];
-                atomicAdd(&head_dot[warp_id][head], contrib);
-            }
-            __syncwarp();
-            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
-                long long dot = head_dot[warp_id][i / RWKV_HEAD_SIZE];
+            for (int h = 0; h < RWKV_N_HEAD; h++) {
+                int base = h * RWKV_HEAD_SIZE;
+                long long partial = 0;
+                for (int i = lane_id; i < RWKV_HEAD_SIZE; i += WARP_SIZE) {
+                    int idx = base + i;
+                    partial += (long long)r[idx] * (long long)k[idx] * (long long)xv[idx];
+                }
+                long long dot = WarpReduce(temp_storage[warp_id]).Sum(partial);
+                dot = warpBroadcast(dot, 0);
                 int32_t dot_scaled = (int32_t)(dot >> 14);
-                a_vec[i] = clip((int32_t)a_vec[i] + ((dot_scaled * (int32_t)v[i]) >> 7));
+                for (int i = lane_id; i < RWKV_HEAD_SIZE; i += WARP_SIZE) {
+                    int idx = base + i;
+                    a_vec[idx] = clip((int32_t)a_vec[idx] + ((dot_scaled * (int32_t)v[idx]) >> 7));
+                }
+                __syncwarp();
             }
-            __syncwarp();
 
             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
                 a_vec[i] = clip(((int32_t)a_vec[i] * (int32_t)g_vec[i]) >> 7);

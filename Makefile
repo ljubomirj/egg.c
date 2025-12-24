@@ -40,6 +40,7 @@ EGG_GPU_METAL_OPTIMIZED_SRC := full_trained_egg-gpu-metal-optimized.mm
 EGG_GPU_OPTIMIZED_SRC := full_trained_egg-gpu-optimized.c
 EGG_GPU_TRAIN_CUDA_SRC := full_cuda_train_egg.cu
 EGG_GPU_TRAIN_TRANSFORMER_CUDA_SRC := full_cuda_train_egg_transformer_adam.cu
+EGG_GPU_TRAIN_RWKV_V7_ROCM_SRC := full_cuda_train_egg-rwkv_v7-rocm.cu
 EGG_GPU_METAL_OBJ := $(BUILD_DIR)/full_trained_egg-gpumulti-metal$(BUILD_SUFFIX).o
 EGG_GPU_METAL_MM_OBJ := $(BUILD_DIR)/full_trained_egg-gpu-metal$(BUILD_SUFFIX).o
 EGG_GPU_METAL_OPTIMIZED_OBJ := $(BUILD_DIR)/full_trained_egg-gpu-metal-optimized$(BUILD_SUFFIX).o
@@ -52,7 +53,7 @@ HIPCC ?= /opt/rocm/bin/hipcc
 
 .PHONY: all clean gpu-targets
 
-all: $(BUILD_DIR)/egg$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-linux-amd64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-macos-arm64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpumulti$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
+all: $(BUILD_DIR)/egg$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-linux-amd64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-macos-arm64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpumulti$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
 
 # Create build directory if it doesn't exist
 $(BUILD_DIR):
@@ -140,6 +141,15 @@ else
 	@echo "Target $@ is only supported on Linux."
 endif
 
+$(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm$(BUILD_SUFFIX): $(EGG_GPU_TRAIN_RWKV_V7_ROCM_SRC) | $(BUILD_DIR)
+ifeq ($(UNAME_S),Linux)
+	@echo "==> $@ ROCm/HIP RWKV v7 training build building..."
+	$(HIPCC) $(OPTFLAGS) -std=c++17 --offload-arch=gfx1100 -mno-wavefrontsize64 -MMD -MP -MF $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm$(BUILD_SUFFIX).d $(EGG_GPU_TRAIN_RWKV_V7_ROCM_SRC) -lm -o $@
+	@echo "[$@ done]"
+else
+	@echo "Target $@ is only supported on Linux."
+endif
+
 $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN): $(EGG_GPU_OPTIMIZED_SRC) $(EGG_GPU_METAL_OPTIMIZED_SRC) | $(BUILD_DIR)
 ifeq ($(UNAME_S),Darwin)
 	@echo "==> $@ Optimized Metal GPU build building..."
@@ -163,7 +173,7 @@ else
 	@echo "Target $@ is only supported on macOS, while this is $(UNAME_S)"
 endif
 
-gpu-targets: $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-cuda$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-vulcan$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-transformer-gpu-linux-rocm$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
+gpu-targets: $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-cuda$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-vulcan$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-transformer-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)
