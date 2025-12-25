@@ -96,8 +96,8 @@ static void get_abs_path(const char *path, char *out_path, size_t out_size) {
     }
 }
 
-static void save_checkpoint(const char *dir, const EggModel *model, uint64_t step, uint64_t seed) {
-    if (!dir || !model) return;
+static void save_checkpoint(const char *dir, const void *model_data, size_t model_size, uint64_t step, uint64_t seed) {
+    if (!dir || !model_data || model_size == 0) return;
     ensure_directory(dir);
 
     char path[PATH_MAX];
@@ -114,10 +114,10 @@ static void save_checkpoint(const char *dir, const EggModel *model, uint64_t ste
     header.version = CHECKPOINT_VERSION;
     header.step = step;
     header.seed = seed;
-    header.data_size = sizeof(EggModel);
+    header.data_size = model_size;
 
     fwrite(&header, sizeof(header), 1, f);
-    fwrite(model, sizeof(EggModel), 1, f);
+    fwrite(model_data, model_size, 1, f);
     fclose(f);
 
     char abs_path[PATH_MAX];
@@ -2193,6 +2193,18 @@ int main(int argc, char **argv) {
     if(!fread(ds.data,1,ds.length,f)) { printf("Error reading input.txt\n"); exit(1); }
     fclose(f); 
 
+    const char *save_dir_env = getenv("EGG_SAVE_DIR");
+    const char *save_dir = (save_dir_env && save_dir_env[0]) ? save_dir_env : "checkpoints";
+    const char *save_every_env = getenv("EGG_SAVE_EVERY");
+    long save_every = 20;
+    if (save_every_env && save_every_env[0]) {
+        char *end = NULL;
+        long val = strtol(save_every_env, &end, 10);
+        if (end && end != save_every_env) {
+            save_every = (val > 0) ? val : 0;
+        }
+    }
+
     // --- Config Dump ---
     {
         long long params_embedding = (long long)VOCAB_SIZE * HIDDEN_DIM;
@@ -2227,18 +2239,6 @@ int main(int argc, char **argv) {
         }
         printf("  Total Params:    %.2f M\n", total_params/1000000.0);
         printf("====================================================\n\n");
-    }
-
-    const char *save_dir_env = getenv("EGG_SAVE_DIR");
-    const char *save_dir = (save_dir_env && save_dir_env[0]) ? save_dir_env : "checkpoints";
-    const char *save_every_env = getenv("EGG_SAVE_EVERY");
-    long save_every = 20;
-    if (save_every_env && save_every_env[0]) {
-        char *end = NULL;
-        long val = strtol(save_every_env, &end, 10);
-        if (end && end != save_every_env) {
-            save_every = (val > 0) ? val : 0;
-        }
     }
 
     EggModel *h_model = (EggModel*)malloc(sizeof(EggModel));
@@ -2534,7 +2534,7 @@ int main(int argc, char **argv) {
 
             if (save_checkpoint_now) {
                 CHECK_CUDA(cudaMemcpy(h_model, d_model, sizeof(EggModel), cudaMemcpyDeviceToHost));
-                save_checkpoint(save_dir, h_model, (uint64_t)step, (uint64_t)seed);
+                save_checkpoint(save_dir, h_model, sizeof(EggModel), (uint64_t)step, (uint64_t)seed);
             }
             
             static uint8_t *d_output = NULL;
