@@ -51,7 +51,7 @@ EGG_GPU_OPTIMIZED_COMPAT_BIN := $(BUILD_DIR)/egg-gpu-optimized$(BUILD_SUFFIX)
 # ROCm/HIP toolchain (Linux)
 HIPCC ?= /opt/rocm/bin/hipcc
 
-.PHONY: all clean gpu-targets
+.PHONY: all clean gpu-targets run-egg-train-rwkv-v7-gpu-linux-rocm-release
 
 all: $(BUILD_DIR)/egg$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-linux-amd64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpu-macos-arm64$(BUILD_SUFFIX) $(BUILD_DIR)/egg-cpumulti$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
 
@@ -174,6 +174,11 @@ else
 endif
 
 gpu-targets: $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-cuda$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gpu-linux-vulcan$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-transformer-gpu-linux-rocm$(BUILD_SUFFIX) $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm$(BUILD_SUFFIX) $(EGG_GPU_MACOS_METAL_OPTIMIZED_BIN)
+
+run-egg-train-rwkv-v7-gpu-linux-rocm-release:
+	@$(MAKE) BUILD=release $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm.release
+	@mkdir -p logs
+	EGG_SAVE_DIR=logs/checkpoints EGG_SAVE_EVERY=20 stdbuf -oL -eL $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm.release | tee logs/run-egg-train-rwkv-v7-gpu-linux-rocm.release.log
 
 clean:
 	rm -rf $(BUILD_DIR)

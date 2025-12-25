@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <math.h>
 #include <time.h>
+#include <inttypes.h>
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
@@ -15,6 +16,10 @@ namespace cub = hipcub;
 #include <cub/cub.cuh>
 #endif
 #include <signal.h>
+#include <sys/stat.h>
+#include <limits.h>
+#include <errno.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <thrust/device_ptr.h>
@@ -50,6 +55,74 @@ static const char *build_name(void) {
 #else
     return "unknown";
 #endif
+}
+
+// Magic: EGGC (Egg Checkpoint)
+#define CHECKPOINT_MAGIC 0x45474743
+#define CHECKPOINT_VERSION 1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t step;
+    uint64_t seed;
+    uint64_t data_size;
+} CheckpointHeader;
+
+static void ensure_directory(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) return;
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+        printf("Warning: failed to create checkpoint dir %s: %s\n", path, strerror(errno));
+    }
+}
+
+static void build_checkpoint_path(const char *dir, uint64_t step, char *out_path, size_t out_size) {
+    if (!dir || !out_path || out_size == 0) return;
+    snprintf(out_path, out_size, "%s/checkpoint_%08" PRIu64 ".bin", dir, step);
+}
+
+static void get_abs_path(const char *path, char *out_path, size_t out_size) {
+    if (!path || !out_path || out_size == 0) return;
+    if (path[0] == '/') {
+        snprintf(out_path, out_size, "%s", path);
+        return;
+    }
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd))) {
+        snprintf(out_path, out_size, "%s/%s", cwd, path);
+    } else {
+        snprintf(out_path, out_size, "%s", path);
+    }
+}
+
+static void save_checkpoint(const char *dir, const EggModel *model, uint64_t step, uint64_t seed) {
+    if (!dir || !model) return;
+    ensure_directory(dir);
+
+    char path[PATH_MAX];
+    build_checkpoint_path(dir, step, path, sizeof(path));
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        printf("Warning: failed to open checkpoint file %s: %s\n", path, strerror(errno));
+        return;
+    }
+
+    CheckpointHeader header;
+    header.magic = CHECKPOINT_MAGIC;
+    header.version = CHECKPOINT_VERSION;
+    header.step = step;
+    header.seed = seed;
+    header.data_size = sizeof(EggModel);
+
+    fwrite(&header, sizeof(header), 1, f);
+    fwrite(model, sizeof(EggModel), 1, f);
+    fclose(f);
+
+    char abs_path[PATH_MAX];
+    get_abs_path(path, abs_path, sizeof(abs_path));
+    printf("Saved checkpoint: %s\n", abs_path);
 }
 
 // --- Configuration ---
@@ -725,10 +798,404 @@ __global__ void generate_sequence_kernel(
     const uint8_t *seed_text,
     int seed_len,
     int gen_len,
+    int8_t * __restrict__ state_x,
+    int8_t * __restrict__ state_ffn,
+    int32_t * __restrict__ state_wkv,
     uint8_t *output
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < gen_len) output[idx] = 0;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (threadIdx.x >= WARP_SIZE) return;
+
+    int8_t *base = s_mem;
+    int8_t *x = base;
+    int8_t *xr = x + HIDDEN_DIM;
+    int8_t *xk = xr + HIDDEN_DIM;
+    int8_t *xv = xk + HIDDEN_DIM;
+    int8_t *xw = xv + HIDDEN_DIM;
+    int8_t *xa = xw + HIDDEN_DIM;
+    int8_t *xg = xa + HIDDEN_DIM;
+    int8_t *r = xg + HIDDEN_DIM;
+    int8_t *k = r + HIDDEN_DIM;
+    int8_t *v = k + HIDDEN_DIM;
+    int8_t *w_decay = v + HIDDEN_DIM;
+    int8_t *a_vec = w_decay + HIDDEN_DIM;
+    int8_t *kk_norm = a_vec + HIDDEN_DIM;
+    int8_t *vvec = kk_norm + HIDDEN_DIM;
+    int8_t *g_vec = vvec + HIDDEN_DIM;
+    int8_t *v_first = g_vec + HIDDEN_DIM;
+    int8_t *emb_cache = v_first + HIDDEN_DIM;
+    int8_t *z = emb_cache + HIDDEN_DIM;
+
+    typedef cub::WarpReduce<long long> WarpReduce;
+    __shared__ typename WarpReduce::TempStorage temp_storage;
+    __shared__ int32_t head_sum[RWKV_N_HEAD];
+    __shared__ int32_t out_state_shared[HIDDEN_DIM];
+    __shared__ uint8_t shared_token;
+    __shared__ int8_t logits_shared[VOCAB_SIZE];
+    __shared__ int32_t exp_shared[VOCAB_SIZE];
+
+    int8_t x_prev_local[N_LAYERS][MAX_STRIDE];
+    int8_t x_prev_ffn_local[N_LAYERS][MAX_STRIDE];
+    for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+        int sub = i / WARP_SIZE;
+        for (int l = 0; l < N_LAYERS; l++) {
+            x_prev_local[l][sub] = state_x[l * HIDDEN_DIM + i];
+            x_prev_ffn_local[l][sub] = state_ffn[l * HIDDEN_DIM + i];
+        }
+    }
+    int32_t *my_wkv = state_wkv;
+
+    int current_token = 0;
+    int total_len = seed_len + gen_len;
+    for (int t = 0; t < total_len; t++) {
+        if (lane_id == 0) {
+            if (t < seed_len) current_token = seed_text[t];
+        }
+        current_token = __shfl_sync(0xFFFFFFFF, current_token, 0);
+
+        for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+            x[i] = model->embedding[i * VOCAB_SIZE + current_token];
+            emb_cache[i] = x[i];
+        }
+        __syncwarp();
+
+        long long local_sum = 0;
+        for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+            long long vabs = (long long)x[i];
+            local_sum += (vabs < 0) ? -vabs : vabs;
+        }
+        long long sum = WarpReduce(temp_storage).Sum(local_sum);
+        sum = warpBroadcast(sum, 0);
+        if (!sum) sum = 1;
+        long long mean = sum / HIDDEN_DIM;
+        if (!mean) mean = 1;
+        for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+            int32_t val = ((long long)x[i] * model->ln0_weight[i]) / mean + model->ln0_bias[i];
+            x[i] = clip(val);
+        }
+        __syncwarp();
+
+        bool v_first_set = false;
+
+        for (int l = 0; l < N_LAYERS; l++) {
+            local_sum = 0;
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                long long vabs = (long long)x[i];
+                local_sum += (vabs < 0) ? -vabs : vabs;
+            }
+            sum = WarpReduce(temp_storage).Sum(local_sum);
+            sum = warpBroadcast(sum, 0);
+            if (!sum) sum = 1;
+            mean = sum / HIDDEN_DIM;
+            if (!mean) mean = 1;
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int32_t val = ((long long)x[i] * model->ln1_weight[l][i]) / mean + model->ln1_bias[l][i];
+                x[i] = clip(val);
+            }
+            __syncwarp();
+
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int sub = i / WARP_SIZE;
+                int8_t x_i = x[i];
+                int8_t prev = x_prev_local[l][sub];
+                int32_t diff = (int32_t)prev - (int32_t)x_i;
+
+                int8_t mix_r = model->x_r[l][i];
+                int8_t mix_w = model->x_w[l][i];
+                int8_t mix_k = model->x_k[l][i];
+                int8_t mix_v = model->x_v[l][i];
+                int8_t mix_a = model->x_a[l][i];
+                int8_t mix_g = model->x_g[l][i];
+
+                xr[i] = clip((long long)x_i + ((diff * (int32_t)mix_r) >> 7));
+                xw[i] = clip((long long)x_i + ((diff * (int32_t)mix_w) >> 7));
+                xk[i] = clip((long long)x_i + ((diff * (int32_t)mix_k) >> 7));
+                xv[i] = clip((long long)x_i + ((diff * (int32_t)mix_v) >> 7));
+                xa[i] = clip((long long)x_i + ((diff * (int32_t)mix_a) >> 7));
+                xg[i] = clip((long long)x_i + ((diff * (int32_t)mix_g) >> 7));
+
+                x_prev_local[l][sub] = x_i;
+            }
+            __syncwarp();
+
+            matmul_perturbed_warp<WarpReduce>(xr, model->receptance[l], HIDDEN_DIM, HIDDEN_DIM,
+                                              0, 0, 0, r, &temp_storage, lane_id);
+            matmul_perturbed_warp<WarpReduce>(xk, model->key[l], HIDDEN_DIM, HIDDEN_DIM,
+                                              0, 0, 0, k, &temp_storage, lane_id);
+            matmul_perturbed_warp<WarpReduce>(xv, model->value[l], HIDDEN_DIM, HIDDEN_DIM,
+                                              0, 0, 0, v, &temp_storage, lane_id);
+            __syncwarp();
+
+            matmul_perturbed_warp<WarpReduce>(xw, model->w1[l], RWKV_MIX_DIM, HIDDEN_DIM,
+                                              0, 0, 0, z, &temp_storage, lane_id);
+            __syncwarp();
+            for (int i = lane_id; i < RWKV_MIX_DIM; i += WARP_SIZE) z[i] = tanh_i8(z[i]);
+            __syncwarp();
+            matmul_perturbed_warp<WarpReduce>(z, model->w2[l], HIDDEN_DIM, RWKV_MIX_DIM,
+                                              0, 0, 0, w_decay, &temp_storage, lane_id);
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int8_t s = sigmoid_i8((int32_t)w_decay[i] + model->w0[l][i]);
+                w_decay[i] = decay_from_sigmoid(s);
+            }
+            __syncwarp();
+
+            matmul_perturbed_warp<WarpReduce>(xa, model->a1[l], RWKV_MIX_DIM, HIDDEN_DIM,
+                                              0, 0, 0, z, &temp_storage, lane_id);
+            __syncwarp();
+            matmul_perturbed_warp<WarpReduce>(z, model->a2[l], HIDDEN_DIM, RWKV_MIX_DIM,
+                                              0, 0, 0, a_vec, &temp_storage, lane_id);
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                a_vec[i] = sigmoid_i8((int32_t)a_vec[i] + model->a0[l][i]);
+            }
+            __syncwarp();
+
+            matmul_perturbed_warp<WarpReduce>(xg, model->g1[l], RWKV_MIX_DIM, HIDDEN_DIM,
+                                              0, 0, 0, z, &temp_storage, lane_id);
+            __syncwarp();
+            for (int i = lane_id; i < RWKV_MIX_DIM; i += WARP_SIZE) z[i] = sigmoid_i8(z[i]);
+            __syncwarp();
+            matmul_perturbed_warp<WarpReduce>(z, model->g2[l], HIDDEN_DIM, RWKV_MIX_DIM,
+                                              0, 0, 0, g_vec, &temp_storage, lane_id);
+            __syncwarp();
+
+            if (!v_first_set) {
+                for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) v_first[i] = v[i];
+            } else {
+                matmul_perturbed_warp<WarpReduce>(xv, model->v1[l], RWKV_MIX_DIM, HIDDEN_DIM,
+                                                  0, 0, 0, z, &temp_storage, lane_id);
+                __syncwarp();
+                matmul_perturbed_warp<WarpReduce>(z, model->v2[l], HIDDEN_DIM, RWKV_MIX_DIM,
+                                                  0, 0, 0, xw, &temp_storage, lane_id);
+                __syncwarp();
+                for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                    int8_t gate = sigmoid_i8((int32_t)xw[i] + model->v0[l][i]);
+                    int32_t dv = ((int32_t)v_first[i] - (int32_t)v[i]) * (int32_t)gate;
+                    v[i] = clip((int32_t)v[i] + (dv >> 7));
+                }
+            }
+            __syncwarp();
+            v_first_set = true;
+
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                xr[i] = model->k_k[l][i];
+                xk[i] = model->k_a[l][i];
+                xv[i] = model->r_k[l][i];
+            }
+            __syncwarp();
+
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                kk_norm[i] = clip(((int32_t)k[i] * (int32_t)xr[i]) >> 7);
+            }
+            __syncwarp();
+
+            if (lane_id < RWKV_N_HEAD) head_sum[lane_id] = 0;
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                long long vabs = (long long)kk_norm[i];
+                atomicAdd(&head_sum[i / RWKV_HEAD_SIZE], (int32_t)((vabs < 0) ? -vabs : vabs));
+            }
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int32_t s = head_sum[i / RWKV_HEAD_SIZE];
+                if (!s) s = 1;
+                kk_norm[i] = (int8_t)(((int32_t)kk_norm[i] * 127) / s);
+            }
+            __syncwarp();
+
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int32_t delta = ((int32_t)a_vec[i] - 127) * (int32_t)xk[i];
+                delta >>= 7;
+                k[i] = clip((int32_t)k[i] + (((int32_t)k[i] * delta) >> 7));
+                vvec[i] = clip(((int32_t)kk_norm[i] * (int32_t)a_vec[i]) >> 7);
+            }
+            __syncwarp();
+
+            int32_t *layer_state = my_wkv + l * (RWKV_N_HEAD * RWKV_HEAD_SIZE * RWKV_HEAD_SIZE);
+            int32_t *out_state = out_state_shared;
+            for (int h = 0; h < RWKV_N_HEAD; h++) {
+                int base = h * RWKV_HEAD_SIZE;
+                int32_t *state = layer_state + h * RWKV_HEAD_SIZE * RWKV_HEAD_SIZE;
+                for (int i = lane_id; i < RWKV_HEAD_SIZE; i += WARP_SIZE) {
+                    int32_t tmp = 0;
+                    for (int j = 0; j < RWKV_HEAD_SIZE; j++) {
+                        int idx = i * RWKV_HEAD_SIZE + j;
+                        int32_t s = state[idx];
+                        s = (s * (int32_t)w_decay[base + j]) >> 7;
+                        state[idx] = s;
+                        tmp += (s * (int32_t)(-kk_norm[base + j])) >> 7;
+                    }
+                    for (int j = 0; j < RWKV_HEAD_SIZE; j++) {
+                        int idx = i * RWKV_HEAD_SIZE + j;
+                        state[idx] += (tmp * (int32_t)vvec[base + j]) >> 7;
+                        state[idx] += ((int32_t)v[base + i] * (int32_t)k[base + j]) >> 7;
+                    }
+                    int32_t acc = 0;
+                    for (int j = 0; j < RWKV_HEAD_SIZE; j++) {
+                        acc += (state[i * RWKV_HEAD_SIZE + j] * (int32_t)r[base + j]) >> 7;
+                    }
+                    out_state[base + i] = acc;
+                }
+            }
+            __syncwarp();
+
+            if (lane_id < RWKV_N_HEAD) head_sum[lane_id] = 0;
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                long long vabs = (long long)out_state[i];
+                atomicAdd(&head_sum[i / RWKV_HEAD_SIZE], (int32_t)((vabs < 0) ? -vabs : vabs));
+            }
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int head = i / RWKV_HEAD_SIZE;
+                int32_t mean_h = head_sum[head] / RWKV_HEAD_SIZE;
+                if (!mean_h) mean_h = 1;
+                int32_t val = (int32_t)(out_state[i] / mean_h);
+                val = val * (int32_t)model->ln_x_weight[l][i] + model->ln_x_bias[l][i];
+                a_vec[i] = clip(val);
+            }
+            __syncwarp();
+
+            for (int h = 0; h < RWKV_N_HEAD; h++) {
+                int base = h * RWKV_HEAD_SIZE;
+                long long partial = 0;
+                for (int i = lane_id; i < RWKV_HEAD_SIZE; i += WARP_SIZE) {
+                    int idx = base + i;
+                    partial += (long long)r[idx] * (long long)k[idx] * (long long)xv[idx];
+                }
+                long long dot = WarpReduce(temp_storage).Sum(partial);
+                dot = warpBroadcast(dot, 0);
+                int32_t dot_scaled = (int32_t)(dot >> 14);
+                for (int i = lane_id; i < RWKV_HEAD_SIZE; i += WARP_SIZE) {
+                    int idx = base + i;
+                    a_vec[idx] = clip((int32_t)a_vec[idx] + ((dot_scaled * (int32_t)v[idx]) >> 7));
+                }
+                __syncwarp();
+            }
+
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                a_vec[i] = clip(((int32_t)a_vec[i] * (int32_t)g_vec[i]) >> 7);
+            }
+            __syncwarp();
+
+            matmul_perturbed_warp<WarpReduce>(a_vec, model->output[l], HIDDEN_DIM, HIDDEN_DIM,
+                                              0, 0, 0, w_decay, &temp_storage, lane_id);
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                x[i] = clip((int32_t)x[i] + w_decay[i]);
+            }
+            __syncwarp();
+
+            local_sum = 0;
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                long long vabs = (long long)x[i];
+                local_sum += (vabs < 0) ? -vabs : vabs;
+            }
+            sum = WarpReduce(temp_storage).Sum(local_sum);
+            sum = warpBroadcast(sum, 0);
+            if (!sum) sum = 1;
+            mean = sum / HIDDEN_DIM;
+            if (!mean) mean = 1;
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int32_t val = ((long long)x[i] * model->ln2_weight[l][i]) / mean + model->ln2_bias[l][i];
+                x[i] = clip(val);
+            }
+            __syncwarp();
+
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int sub = i / WARP_SIZE;
+                int8_t prev = x_prev_ffn_local[l][sub];
+                int32_t diff = (int32_t)prev - (int32_t)x[i];
+                int8_t mix = model->ffn_xk[l][i];
+                xk[i] = clip((long long)x[i] + ((diff * (int32_t)mix) >> 7));
+                x_prev_ffn_local[l][sub] = x[i];
+            }
+            __syncwarp();
+
+            matmul_perturbed_warp<WarpReduce>(xk, model->ffn_key[l], HIDDEN_DIM, HIDDEN_DIM,
+                                              0, 0, 0, r, &temp_storage, lane_id);
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                int32_t val = r[i];
+                if (val < 0) val = 0;
+                val = (val * val) >> 7;
+                r[i] = clip(val);
+            }
+            __syncwarp();
+
+            matmul_perturbed_warp<WarpReduce>(r, model->ffn_value[l], HIDDEN_DIM, HIDDEN_DIM,
+                                              0, 0, 0, w_decay, &temp_storage, lane_id);
+            __syncwarp();
+            for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+                x[i] = clip((int32_t)x[i] + w_decay[i]);
+            }
+            __syncwarp();
+        }
+
+        local_sum = 0;
+        for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+            long long vabs = (long long)x[i];
+            local_sum += (vabs < 0) ? -vabs : vabs;
+        }
+        sum = WarpReduce(temp_storage).Sum(local_sum);
+        sum = warpBroadcast(sum, 0);
+        if (!sum) sum = 1;
+        mean = sum / HIDDEN_DIM;
+        if (!mean) mean = 1;
+        for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+            int32_t val = ((long long)x[i] * model->ln_out_weight[i]) / mean + model->ln_out_bias[i];
+            x[i] = clip(val);
+        }
+        __syncwarp();
+
+        matmul_perturbed_warp<WarpReduce>(emb_cache, model->couple_b, COUPLE_RANK, HIDDEN_DIM,
+                                          0, 0, 0, z, &temp_storage, lane_id);
+        __syncwarp();
+
+        if (t >= seed_len) {
+            if (lane_id == 0) {
+                long long sum_exp = 0;
+                for (int i = 0; i < VOCAB_SIZE; i++) {
+                    long long acc = 0;
+                    for (int k_idx = 0; k_idx < HIDDEN_DIM; k_idx++) {
+                        acc += (long long)x[k_idx] * model->head_y[k_idx * VOCAB_SIZE + i];
+                    }
+                    long long acc_couple = 0;
+                    for (int k_idx = 0; k_idx < COUPLE_RANK; k_idx++) {
+                        acc_couple += (long long)z[k_idx] * model->couple_a[k_idx * VOCAB_SIZE + i];
+                    }
+                    int8_t logit_i = clip((acc >> RWKV_MATMUL_SHIFT) + (acc_couple >> RWKV_MATMUL_SHIFT));
+                    logits_shared[i] = logit_i;
+                    int idx = (int32_t)logit_i + 128;
+                    idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+                    exp_shared[i] = d_EXP2_TABLE[idx];
+                    sum_exp += exp_shared[i];
+                }
+
+                uint32_t r_val = hash_rng(seed + t * 222, 0);
+                long long r_threshold = (sum_exp > 0) ? (r_val % sum_exp) : 0;
+                long long running = 0;
+                int next_token = VOCAB_SIZE - 1;
+                for (int i = 0; i < VOCAB_SIZE; i++) {
+                    running += exp_shared[i];
+                    if (running > r_threshold) { next_token = i; break; }
+                }
+                current_token = next_token;
+                shared_token = (uint8_t)next_token;
+                output[t - seed_len] = shared_token;
+            }
+            current_token = __shfl_sync(0xFFFFFFFF, current_token, 0);
+        }
+    }
+
+    for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
+        int sub = i / WARP_SIZE;
+        for (int l = 0; l < N_LAYERS; l++) {
+            state_x[l * HIDDEN_DIM + i] = x_prev_local[l][sub];
+            state_ffn[l * HIDDEN_DIM + i] = x_prev_ffn_local[l][sub];
+        }
+    }
 }
 
 #if 0
@@ -1711,8 +2178,16 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaMemcpyToSymbol(d_DECAY_TABLE, h_DECAY_TABLE, 128*sizeof(int8_t)));
     
     Dataset ds = {0,0};
-    FILE *f = fopen("input.txt", "rb");
+    const char *input_path = "input.txt";
+    FILE *f = fopen(input_path, "rb");
     if(!f) { printf("Error: input.txt not found!\n"); exit(1); }
+    struct stat st;
+    long long input_size = -1;
+    if (stat(input_path, &st) == 0) input_size = (long long)st.st_size;
+    char input_real[PATH_MAX];
+    const char *input_display = input_path;
+    if (realpath(input_path, input_real)) input_display = input_real;
+    printf("Input: %s (%lld bytes)\n", input_display, input_size);
     fseek(f,0,SEEK_END); ds.length=ftell(f); fseek(f,0,SEEK_SET); 
     ds.data=(uint8_t*)malloc(ds.length); 
     if(!fread(ds.data,1,ds.length,f)) { printf("Error reading input.txt\n"); exit(1); }
@@ -1745,8 +2220,25 @@ int main(int argc, char **argv) {
         printf("  Mix Dim:         %d\n", RWKV_MIX_DIM);
         printf("  Couple Rank:     %d\n", COUPLE_RANK);
         printf("  Seq Len:         %d\n", SEQ_LEN);
+        if (save_every > 0) {
+            printf("  Checkpoints:     %s (every %ld steps)\n", save_dir, save_every);
+        } else {
+            printf("  Checkpoints:     disabled\n");
+        }
         printf("  Total Params:    %.2f M\n", total_params/1000000.0);
         printf("====================================================\n\n");
+    }
+
+    const char *save_dir_env = getenv("EGG_SAVE_DIR");
+    const char *save_dir = (save_dir_env && save_dir_env[0]) ? save_dir_env : "checkpoints";
+    const char *save_every_env = getenv("EGG_SAVE_EVERY");
+    long save_every = 20;
+    if (save_every_env && save_every_env[0]) {
+        char *end = NULL;
+        long val = strtol(save_every_env, &end, 10);
+        if (end && end != save_every_env) {
+            save_every = (val > 0) ? val : 0;
+        }
     }
 
     EggModel *h_model = (EggModel*)malloc(sizeof(EggModel));
@@ -1777,6 +2269,15 @@ int main(int argc, char **argv) {
     size_t wkv_state_size = (size_t)POPULATION_SIZE * N_LAYERS * RWKV_N_HEAD * RWKV_HEAD_SIZE * RWKV_HEAD_SIZE * sizeof(int32_t);
     CHECK_CUDA(cudaMalloc(&d_state_wkv, wkv_state_size));
     CHECK_CUDA(cudaMemset(d_state_wkv, 0, wkv_state_size));
+
+    int8_t *d_gen_state_x = NULL;
+    int8_t *d_gen_state_ffn = NULL;
+    int32_t *d_gen_state_wkv = NULL;
+    size_t gen_state_size = (size_t)N_LAYERS * HIDDEN_DIM * sizeof(int8_t);
+    size_t gen_wkv_state_size = (size_t)N_LAYERS * RWKV_N_HEAD * RWKV_HEAD_SIZE * RWKV_HEAD_SIZE * sizeof(int32_t);
+    CHECK_CUDA(cudaMalloc(&d_gen_state_x, gen_state_size));
+    CHECK_CUDA(cudaMalloc(&d_gen_state_ffn, gen_state_size));
+    CHECK_CUDA(cudaMalloc(&d_gen_state_wkv, gen_wkv_state_size));
     
     printf("Starting EGGROLL RWKV v7 CUDA Training (Batch=%d)...\n", BATCH);
     long max_steps = (ds.length - 1) / SEQ_LEN;
@@ -1831,8 +2332,10 @@ int main(int argc, char **argv) {
         
         if (!keep_running) break;
 
+        int save_checkpoint_now = (save_every > 0) && (step % save_every == 0);
+
         // Debug prints
-        if (step % 10 == 0) {
+        if (save_checkpoint_now) {
             thrust::device_ptr<int32_t> t_fitnesses(d_fitnesses);
             int fit_sum = thrust::transform_reduce(
                 thrust::device,
@@ -2028,6 +2531,11 @@ int main(int argc, char **argv) {
         if (step % 1 == 0) { 
             int32_t h_updates[2];
             CHECK_CUDA(cudaMemcpyFromSymbol(h_updates, d_debug_updates, 2*sizeof(int32_t), 0, cudaMemcpyDeviceToHost));
+
+            if (save_checkpoint_now) {
+                CHECK_CUDA(cudaMemcpy(h_model, d_model, sizeof(EggModel), cudaMemcpyDeviceToHost));
+                save_checkpoint(save_dir, h_model, (uint64_t)step, (uint64_t)seed);
+            }
             
             static uint8_t *d_output = NULL;
             static uint8_t *h_output = NULL;
@@ -2037,9 +2545,14 @@ int main(int argc, char **argv) {
                 CHECK_CUDA(cudaMalloc(&d_output, gen_len));
                 h_output = (uint8_t*)malloc(gen_len);
             }
-            
-            generate_sequence_kernel<<<1, 256, 0>>>(
-                d_model, seed + 12345, d_dataset + start_idx, seed_len, gen_len, d_output
+            CHECK_CUDA(cudaMemset(d_gen_state_x, 0, gen_state_size));
+            CHECK_CUDA(cudaMemset(d_gen_state_ffn, 0, gen_state_size));
+            CHECK_CUDA(cudaMemset(d_gen_state_wkv, 0, gen_wkv_state_size));
+
+            generate_sequence_kernel<<<1, WARP_SIZE, SHARED_STRIDE * sizeof(int8_t)>>>(
+                d_model, seed + 12345, d_dataset + start_idx, seed_len, gen_len,
+                d_gen_state_x, d_gen_state_ffn, d_gen_state_wkv,
+                d_output
             );
             CHECK_CUDA(cudaDeviceSynchronize()); 
             CHECK_CUDA(cudaMemcpy(h_output, d_output, gen_len, cudaMemcpyDeviceToHost));
@@ -2086,6 +2599,9 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaFree(d_state_x));
     CHECK_CUDA(cudaFree(d_state_ffn));
     CHECK_CUDA(cudaFree(d_state_wkv));
+    CHECK_CUDA(cudaFree(d_gen_state_x));
+    CHECK_CUDA(cudaFree(d_gen_state_ffn));
+    CHECK_CUDA(cudaFree(d_gen_state_wkv));
     
     return 0;
 }
