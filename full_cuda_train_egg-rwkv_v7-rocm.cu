@@ -17,6 +17,7 @@ namespace cub = hipcub;
 #endif
 #include <signal.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <limits.h>
 #include <errno.h>
 #include <string.h>
@@ -125,6 +126,71 @@ static void save_checkpoint(const char *dir, const void *model_data, size_t mode
     printf("Saved checkpoint: %s\n", abs_path);
 }
 
+static int load_checkpoint_file(const char *path, void *model_data, size_t model_size, uint64_t *step, uint64_t *seed) {
+    if (!path || !model_data || model_size == 0) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    CheckpointHeader header;
+    if (fread(&header, sizeof(header), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    if (header.magic != CHECKPOINT_MAGIC || header.version != CHECKPOINT_VERSION) {
+        fclose(f);
+        return 0;
+    }
+    if (header.data_size != model_size) {
+        fclose(f);
+        return 0;
+    }
+    if (fread(model_data, model_size, 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    if (step) *step = header.step;
+    if (seed) *seed = header.seed;
+    return 1;
+}
+
+static int load_latest_checkpoint(const char *dir, char *out_path, size_t out_size, void *model_data, size_t model_size, uint64_t *step, uint64_t *seed) {
+    if (!dir || !model_data || model_size == 0) return 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+
+    struct dirent *ent;
+    uint64_t max_step = 0;
+    int found = 0;
+    char best_name[256] = {0};
+
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        if (strncmp(name, "checkpoint_", 11) == 0) {
+            const char *dot = strstr(name, ".bin");
+            if (!dot) continue;
+            const char *num_str = name + 11;
+            char *end = NULL;
+            uint64_t s = strtoull(num_str, &end, 10);
+            if (end && end != num_str && dot == end) {
+                if (!found || s > max_step) {
+                    max_step = s;
+                    snprintf(best_name, sizeof(best_name), "%s", name);
+                    found = 1;
+                }
+            }
+        }
+    }
+    closedir(d);
+    if (!found) return 0;
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", dir, best_name);
+    if (!load_checkpoint_file(path, model_data, model_size, step, seed)) return 0;
+    if (out_path && out_size > 0) snprintf(out_path, out_size, "%s", path);
+    return 1;
+}
+
 // --- Configuration ---
 #define SM_CORES 128
 #define WARP_SIZE 32
@@ -151,6 +217,7 @@ static void save_checkpoint(const char *dir, const void *model_data, size_t mode
 #define LOSS_X_DEN 5
 #define VEC_NOISE_SHIFT 4
 #define RWKV_MATMUL_SHIFT 8
+#define TEMP_SCALE_SHIFT 8
 
 #define SHARED_STRIDE (HIDDEN_DIM * 17 + RWKV_Z_DIM)
 #define MAX_STRIDE 8
@@ -349,6 +416,12 @@ static inline uint32_t xorshift32_host(uint32_t *state) {
     uint32_t x = *state;
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
     *state = x;
+    return x;
+}
+
+static inline uint32_t hash_rng_host(uint32_t s, uint32_t idx) {
+    uint32_t x = s + idx * 0x9e3779b9u;
+    x ^= x >> 16; x *= 0x85ebca6b; x ^= x >> 13; x *= 0xc2b2ae35; x ^= x >> 16;
     return x;
 }
 
@@ -798,9 +871,12 @@ __global__ void generate_sequence_kernel(
     const uint8_t *seed_text,
     int seed_len,
     int gen_len,
+    int temp_scale_y,
+    int temp_scale_x,
     int8_t * __restrict__ state_x,
     int8_t * __restrict__ state_ffn,
     int32_t * __restrict__ state_wkv,
+    uint8_t *output_x,
     uint8_t *output
 ) {
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -1153,37 +1229,108 @@ __global__ void generate_sequence_kernel(
                                           0, 0, 0, z, &temp_storage, lane_id);
         __syncwarp();
 
+        if (t < seed_len) {
+            if (lane_id == 0) {
+                if (temp_scale_x <= 0) {
+                    int best_idx = 0;
+                    int best_logit = -999999;
+                    for (int i = 0; i < VOCAB_SIZE; i++) {
+                        long long acc = 0;
+                        for (int k_idx = 0; k_idx < HIDDEN_DIM; k_idx++) {
+                            acc += (long long)x[k_idx] * model->head_x[k_idx * VOCAB_SIZE + i];
+                        }
+                        int8_t logit_i = clip(acc >> RWKV_MATMUL_SHIFT);
+                        if ((int)logit_i > best_logit) {
+                            best_logit = (int)logit_i;
+                            best_idx = i;
+                        }
+                    }
+                    output_x[t] = (uint8_t)best_idx;
+                } else {
+                    long long sum_exp = 0;
+                    for (int i = 0; i < VOCAB_SIZE; i++) {
+                        long long acc = 0;
+                        for (int k_idx = 0; k_idx < HIDDEN_DIM; k_idx++) {
+                            acc += (long long)x[k_idx] * model->head_x[k_idx * VOCAB_SIZE + i];
+                        }
+                        int32_t scaled = ((int32_t)clip(acc >> RWKV_MATMUL_SHIFT) * temp_scale_x) >> TEMP_SCALE_SHIFT;
+                        if (scaled > 127) scaled = 127;
+                        if (scaled < -127) scaled = -127;
+                        logits_shared[i] = (int8_t)scaled;
+                        int idx = scaled + 128;
+                        exp_shared[i] = d_EXP2_TABLE[idx];
+                        sum_exp += exp_shared[i];
+                    }
+
+                    uint32_t r_val = hash_rng(seed + t * 131, 0);
+                    long long r_threshold = (sum_exp > 0) ? (r_val % sum_exp) : 0;
+                    long long running = 0;
+                    int next_token = VOCAB_SIZE - 1;
+                    for (int i = 0; i < VOCAB_SIZE; i++) {
+                        running += exp_shared[i];
+                        if (running > r_threshold) { next_token = i; break; }
+                    }
+                    output_x[t] = (uint8_t)next_token;
+                }
+            }
+        }
+
         if (t >= seed_len) {
             if (lane_id == 0) {
-                long long sum_exp = 0;
-                for (int i = 0; i < VOCAB_SIZE; i++) {
-                    long long acc = 0;
-                    for (int k_idx = 0; k_idx < HIDDEN_DIM; k_idx++) {
-                        acc += (long long)x[k_idx] * model->head_y[k_idx * VOCAB_SIZE + i];
+                if (temp_scale_y <= 0) {
+                    int best_idx = 0;
+                    int best_logit = -999999;
+                    for (int i = 0; i < VOCAB_SIZE; i++) {
+                        long long acc = 0;
+                        for (int k_idx = 0; k_idx < HIDDEN_DIM; k_idx++) {
+                            acc += (long long)x[k_idx] * model->head_y[k_idx * VOCAB_SIZE + i];
+                        }
+                        long long acc_couple = 0;
+                        for (int k_idx = 0; k_idx < COUPLE_RANK; k_idx++) {
+                            acc_couple += (long long)z[k_idx] * model->couple_a[k_idx * VOCAB_SIZE + i];
+                        }
+                        int8_t logit_i = clip((acc >> RWKV_MATMUL_SHIFT) + (acc_couple >> RWKV_MATMUL_SHIFT));
+                        if ((int)logit_i > best_logit) {
+                            best_logit = (int)logit_i;
+                            best_idx = i;
+                        }
                     }
-                    long long acc_couple = 0;
-                    for (int k_idx = 0; k_idx < COUPLE_RANK; k_idx++) {
-                        acc_couple += (long long)z[k_idx] * model->couple_a[k_idx * VOCAB_SIZE + i];
+                    current_token = best_idx;
+                    shared_token = (uint8_t)best_idx;
+                    output[t - seed_len] = shared_token;
+                } else {
+                    long long sum_exp = 0;
+                    for (int i = 0; i < VOCAB_SIZE; i++) {
+                        long long acc = 0;
+                        for (int k_idx = 0; k_idx < HIDDEN_DIM; k_idx++) {
+                            acc += (long long)x[k_idx] * model->head_y[k_idx * VOCAB_SIZE + i];
+                        }
+                        long long acc_couple = 0;
+                        for (int k_idx = 0; k_idx < COUPLE_RANK; k_idx++) {
+                            acc_couple += (long long)z[k_idx] * model->couple_a[k_idx * VOCAB_SIZE + i];
+                        }
+                        int32_t logit = (int32_t)clip((acc >> RWKV_MATMUL_SHIFT) + (acc_couple >> RWKV_MATMUL_SHIFT));
+                        int32_t scaled = (logit * temp_scale_y) >> TEMP_SCALE_SHIFT;
+                        if (scaled > 127) scaled = 127;
+                        if (scaled < -127) scaled = -127;
+                        logits_shared[i] = (int8_t)scaled;
+                        int idx = scaled + 128;
+                        exp_shared[i] = d_EXP2_TABLE[idx];
+                        sum_exp += exp_shared[i];
                     }
-                    int8_t logit_i = clip((acc >> RWKV_MATMUL_SHIFT) + (acc_couple >> RWKV_MATMUL_SHIFT));
-                    logits_shared[i] = logit_i;
-                    int idx = (int32_t)logit_i + 128;
-                    idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
-                    exp_shared[i] = d_EXP2_TABLE[idx];
-                    sum_exp += exp_shared[i];
-                }
 
-                uint32_t r_val = hash_rng(seed + t * 222, 0);
-                long long r_threshold = (sum_exp > 0) ? (r_val % sum_exp) : 0;
-                long long running = 0;
-                int next_token = VOCAB_SIZE - 1;
-                for (int i = 0; i < VOCAB_SIZE; i++) {
-                    running += exp_shared[i];
-                    if (running > r_threshold) { next_token = i; break; }
+                    uint32_t r_val = hash_rng(seed + t * 222, 0);
+                    long long r_threshold = (sum_exp > 0) ? (r_val % sum_exp) : 0;
+                    long long running = 0;
+                    int next_token = VOCAB_SIZE - 1;
+                    for (int i = 0; i < VOCAB_SIZE; i++) {
+                        running += exp_shared[i];
+                        if (running > r_threshold) { next_token = i; break; }
+                    }
+                    current_token = next_token;
+                    shared_token = (uint8_t)next_token;
+                    output[t - seed_len] = shared_token;
                 }
-                current_token = next_token;
-                shared_token = (uint8_t)next_token;
-                output[t - seed_len] = shared_token;
             }
             current_token = __shfl_sync(0xFFFFFFFF, current_token, 0);
         }
@@ -2160,6 +2307,39 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_sigint);
     srand(time(NULL));
 
+    const char *cli_load_path = NULL;
+    const char *cli_load_dir = NULL;
+    const char *cli_save_dir = NULL;
+    const char *cli_save_every = NULL;
+    const char *cli_seed = NULL;
+    const char *cli_temp = NULL;
+    const char *cli_temp_x = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!strcmp(arg, "--help") || !strcmp(arg, "-h")) {
+            printf("Usage: %s [--load PATH] [--load-dir DIR] [--save-dir DIR] [--save-every N]\n", argv[0]);
+            printf("       [--seed SEED] [--temp T] [--temp-x T]\n");
+            return 0;
+        } else if (!strcmp(arg, "--load") && i + 1 < argc) {
+            cli_load_path = argv[++i];
+        } else if (!strcmp(arg, "--load-dir") && i + 1 < argc) {
+            cli_load_dir = argv[++i];
+        } else if (!strcmp(arg, "--save-dir") && i + 1 < argc) {
+            cli_save_dir = argv[++i];
+        } else if (!strcmp(arg, "--save-every") && i + 1 < argc) {
+            cli_save_every = argv[++i];
+        } else if (!strcmp(arg, "--seed") && i + 1 < argc) {
+            cli_seed = argv[++i];
+        } else if (!strcmp(arg, "--temp") && i + 1 < argc) {
+            cli_temp = argv[++i];
+        } else if (!strcmp(arg, "--temp-x") && i + 1 < argc) {
+            cli_temp_x = argv[++i];
+        } else {
+            printf("Warning: unknown arg %s\n", arg);
+        }
+    }
+
     char datetime[64];
     format_local_datetime(datetime, sizeof(datetime));
     printf("Starting EGGROLL HIP/CUDA Training | Binary: %s | BUILD=%s | Datetime: %s\n",
@@ -2193,16 +2373,138 @@ int main(int argc, char **argv) {
     if(!fread(ds.data,1,ds.length,f)) { printf("Error reading input.txt\n"); exit(1); }
     fclose(f); 
 
+
     const char *save_dir_env = getenv("EGG_SAVE_DIR");
     const char *save_dir = (save_dir_env && save_dir_env[0]) ? save_dir_env : "checkpoints";
+    if (cli_save_dir && cli_save_dir[0]) save_dir = cli_save_dir;
+
     const char *save_every_env = getenv("EGG_SAVE_EVERY");
-    long save_every = 20;
+    long save_every = 100;
     if (save_every_env && save_every_env[0]) {
         char *end = NULL;
         long val = strtol(save_every_env, &end, 10);
         if (end && end != save_every_env) {
             save_every = (val > 0) ? val : 0;
         }
+    }
+    if (cli_save_every && cli_save_every[0]) {
+        char *end = NULL;
+        long val = strtol(cli_save_every, &end, 10);
+        if (end && end != cli_save_every) {
+            save_every = (val > 0) ? val : 0;
+        }
+    }
+
+    const char *temp_env = getenv("EGG_TEMP");
+    const char *temp_x_env = getenv("EGG_TEMP_X");
+    double temp = 1.0;
+    if (temp_env && temp_env[0]) {
+        char *end = NULL;
+        double val = strtod(temp_env, &end);
+        if (end && end != temp_env) temp = val;
+    }
+    if (cli_temp && cli_temp[0]) {
+        char *end = NULL;
+        double val = strtod(cli_temp, &end);
+        if (end && end != cli_temp) temp = val;
+    }
+    double temp_x = temp;
+    if (temp_x_env && temp_x_env[0]) {
+        char *end = NULL;
+        double val = strtod(temp_x_env, &end);
+        if (end && end != temp_x_env) temp_x = val;
+    }
+    if (cli_temp_x && cli_temp_x[0]) {
+        char *end = NULL;
+        double val = strtod(cli_temp_x, &end);
+        if (end && end != cli_temp_x) temp_x = val;
+    }
+    int temp_scale_y = 0;
+    int temp_scale_x = 0;
+    if (temp > 0.0) {
+        double scale = (1.0 / temp) * (double)(1 << TEMP_SCALE_SHIFT);
+        long long scaled = llrint(scale);
+        if (scaled < 1) scaled = 1;
+        if (scaled > 1LL << 30) scaled = 1LL << 30;
+        temp_scale_y = (int)scaled;
+    }
+    if (temp_x > 0.0) {
+        double scale = (1.0 / temp_x) * (double)(1 << TEMP_SCALE_SHIFT);
+        long long scaled = llrint(scale);
+        if (scaled < 1) scaled = 1;
+        if (scaled > 1LL << 30) scaled = 1LL << 30;
+        temp_scale_x = (int)scaled;
+    }
+
+    const char *load_path_env = getenv("EGG_LOAD_PATH");
+    const char *load_dir_env = getenv("EGG_LOAD_DIR");
+    const char *load_path = (cli_load_path && cli_load_path[0]) ? cli_load_path : load_path_env;
+    const char *load_dir = (cli_load_dir && cli_load_dir[0]) ? cli_load_dir : load_dir_env;
+
+    EggModel *h_model = (EggModel*)malloc(sizeof(EggModel));
+    uint64_t loaded_step = 0;
+    uint64_t loaded_seed = 0;
+    int loaded = 0;
+    char loaded_path[PATH_MAX] = {0};
+
+    if (load_path && load_path[0]) {
+        char abs_path[PATH_MAX];
+        get_abs_path(load_path, abs_path, sizeof(abs_path));
+        if (load_checkpoint_file(abs_path, h_model, sizeof(EggModel), &loaded_step, &loaded_seed)) {
+            snprintf(loaded_path, sizeof(loaded_path), "%s", abs_path);
+            loaded = 1;
+        } else {
+            printf("Warning: failed to load checkpoint from %s\n", abs_path);
+        }
+    } else if (load_dir && load_dir[0]) {
+        char abs_dir[PATH_MAX];
+        get_abs_path(load_dir, abs_dir, sizeof(abs_dir));
+        if (load_latest_checkpoint(abs_dir, loaded_path, sizeof(loaded_path), h_model, sizeof(EggModel), &loaded_step, &loaded_seed)) {
+            loaded = 1;
+        } else {
+            printf("Warning: no checkpoint found in %s\n", abs_dir);
+        }
+    }
+
+    if (!loaded) {
+        init_model(h_model);
+    } else {
+        printf("Loaded checkpoint: %s (step %" PRIu64 ", seed %" PRIu64 ")\n", loaded_path, loaded_step, loaded_seed);
+    }
+
+    const char *seed_env = getenv("EGG_SEED");
+    printf("Options: save_dir=%s save_every=%ld temp=%.3f temp_x=%.3f ",
+           save_dir, save_every, temp, temp_x);
+    if (loaded) {
+        printf("load=%s ", loaded_path);
+    } else if (load_path && load_path[0]) {
+        printf("load=%s ", load_path);
+    } else if (load_dir && load_dir[0]) {
+        printf("load_dir=%s ", load_dir);
+    } else {
+        printf("load=none ");
+    }
+    if (cli_seed && cli_seed[0]) {
+        printf("seed(cli)=%s\n", cli_seed);
+    } else if (seed_env && seed_env[0]) {
+        printf("seed(env)=%s\n", seed_env);
+    } else {
+        printf("seed=auto\n");
+    }
+    uint32_t current_seed = 0;
+    if (loaded) {
+        current_seed = (uint32_t)loaded_seed;
+    } else if (cli_seed && cli_seed[0]) {
+        char *end = NULL;
+        unsigned long long val = strtoull(cli_seed, &end, 10);
+        if (end && end != cli_seed) current_seed = (uint32_t)val;
+    } else if (seed_env && seed_env[0]) {
+        char *end = NULL;
+        unsigned long long val = strtoull(seed_env, &end, 10);
+        if (end && end != seed_env) current_seed = (uint32_t)val;
+    }
+    if (current_seed == 0) {
+        current_seed = (uint32_t)time(NULL);
     }
 
     // --- Config Dump ---
@@ -2232,6 +2534,14 @@ int main(int argc, char **argv) {
         printf("  Mix Dim:         %d\n", RWKV_MIX_DIM);
         printf("  Couple Rank:     %d\n", COUPLE_RANK);
         printf("  Seq Len:         %d\n", SEQ_LEN);
+        printf("  Temp Y:          %.3f\n", temp);
+        printf("  Temp X:          %.3f\n", temp_x);
+        printf("  Seed:            %u\n", current_seed);
+        if (loaded) {
+            printf("  Checkpoint:      %s (step %" PRIu64 ")\n", loaded_path, loaded_step);
+        } else {
+            printf("  Checkpoint:      none\n");
+        }
         if (save_every > 0) {
             printf("  Checkpoints:     %s (every %ld steps)\n", save_dir, save_every);
         } else {
@@ -2240,9 +2550,6 @@ int main(int argc, char **argv) {
         printf("  Total Params:    %.2f M\n", total_params/1000000.0);
         printf("====================================================\n\n");
     }
-
-    EggModel *h_model = (EggModel*)malloc(sizeof(EggModel));
-    init_model(h_model); 
     
     EggModel *d_model;
     CHECK_CUDA(cudaMalloc(&d_model, sizeof(EggModel)));
@@ -2281,16 +2588,22 @@ int main(int argc, char **argv) {
     
     printf("Starting EGGROLL RWKV v7 CUDA Training (Batch=%d)...\n", BATCH);
     long max_steps = (ds.length - 1) / SEQ_LEN;
+    long start_step = loaded ? (long)loaded_step + 1 : 0;
+    if (start_step < 0) start_step = 0;
+    if (start_step >= max_steps) {
+        printf("Warning: checkpoint step %ld exceeds max_steps %ld; starting at 0\n", start_step, max_steps);
+        start_step = 0;
+    }
     
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
     unsigned long total_tokens = 0;
 
-    for(long step=0; step<max_steps && keep_running; step++) {
+    for(long step=start_step; step<max_steps && keep_running; step++) {
         struct timespec t0, t1, t2, t3;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        uint32_t seed = (uint32_t)time(NULL) ^ (step * 0x9e3779b9);
+        uint32_t seed = current_seed;
         int start_idx = step * SEQ_LEN;
         
         int threads_per_block = BLOCK_THREADS;
@@ -2528,22 +2841,29 @@ int main(int argc, char **argv) {
         clock_gettime(CLOCK_MONOTONIC, &end);
         total_tokens += POPULATION_SIZE * SEQ_LEN;
         
+        uint32_t next_seed = hash_rng_host(current_seed, (uint32_t)(step + 1));
+
         if (step % 1 == 0) { 
             int32_t h_updates[2];
             CHECK_CUDA(cudaMemcpyFromSymbol(h_updates, d_debug_updates, 2*sizeof(int32_t), 0, cudaMemcpyDeviceToHost));
-
             if (save_checkpoint_now) {
                 CHECK_CUDA(cudaMemcpy(h_model, d_model, sizeof(EggModel), cudaMemcpyDeviceToHost));
-                save_checkpoint(save_dir, h_model, sizeof(EggModel), (uint64_t)step, (uint64_t)seed);
+                save_checkpoint(save_dir, h_model, sizeof(EggModel), (uint64_t)step, (uint64_t)next_seed);
             }
             
             static uint8_t *d_output = NULL;
             static uint8_t *h_output = NULL;
+            static uint8_t *d_output_x = NULL;
+            static uint8_t *h_output_x = NULL;
             int seed_len = 30; 
             int gen_len = 50;
             if(!d_output) {
                 CHECK_CUDA(cudaMalloc(&d_output, gen_len));
                 h_output = (uint8_t*)malloc(gen_len);
+            }
+            if (!d_output_x) {
+                CHECK_CUDA(cudaMalloc(&d_output_x, seed_len));
+                h_output_x = (uint8_t*)malloc(seed_len);
             }
             CHECK_CUDA(cudaMemset(d_gen_state_x, 0, gen_state_size));
             CHECK_CUDA(cudaMemset(d_gen_state_ffn, 0, gen_state_size));
@@ -2551,11 +2871,14 @@ int main(int argc, char **argv) {
 
             generate_sequence_kernel<<<1, WARP_SIZE, SHARED_STRIDE * sizeof(int8_t)>>>(
                 d_model, seed + 12345, d_dataset + start_idx, seed_len, gen_len,
+                temp_scale_y, temp_scale_x,
                 d_gen_state_x, d_gen_state_ffn, d_gen_state_wkv,
+                d_output_x,
                 d_output
             );
             CHECK_CUDA(cudaDeviceSynchronize()); 
             CHECK_CUDA(cudaMemcpy(h_output, d_output, gen_len, cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(h_output_x, d_output_x, seed_len, cudaMemcpyDeviceToHost));
             
             printf("\033[32m");
             for(int i=0; i<seed_len; i++) {
@@ -2565,6 +2888,13 @@ int main(int argc, char **argv) {
             printf("\033[36m");
             for(int i=0; i<gen_len; i++) {
                 char c = h_output[i];
+                if(c>=32 && c<=126) printf("%c", c); else printf(".");
+            }
+            printf("\033[0m\n");
+
+            printf("\033[92m");
+            for(int i=0; i<seed_len; i++) {
+                char c = h_output_x[i];
                 if(c>=32 && c<=126) printf("%c", c); else printf(".");
             }
             printf("\033[0m\n");
@@ -2582,6 +2912,8 @@ int main(int argc, char **argv) {
                step, current_loss_per_token, h_updates[0], h_updates[1], 
                fwd_ms, host_ms, upd_ms, steps_per_sec, mtok_per_s);
         }
+
+        current_seed = next_seed;
     }
 
     if (!keep_running) {

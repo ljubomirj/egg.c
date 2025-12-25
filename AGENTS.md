@@ -71,7 +71,11 @@ https://github.com/ESHyperscale/nano-egg
 
 ## Overview
 
-EGGROLL in C is a minimalist, dependency-free implementation of the **EGGROLL** (Evolution Guided General Optimization via Low-rank Learning) algorithm in pure C. It demonstrates **integer-only training** of a language model using Evolution Strategies with low-rank perturbations instead of backpropagation.
+EGGROLL (by @d0rc, upstream https://github.com/d0rc/egg.c) in C is a minimalist, dependency-free implementation of the **EGGROLL** (Evolution Guided General Optimization via Low-rank Learning; by @bidiptas13 blogpost https://eshyperscale.github.io/ and refs) algorithm in pure C. It demonstrates **integer-only training** of a language model using Evolution Strategies with low-rank perturbations instead of backpropagation.
+
+RNN RWKV https://www.rwkv.com/ by @BlinkDL v7 snapshot taken 2025-12-24 https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7.
+
+Architecture input (x)->(x,y) output joint inspired by ARC-1 work by @evilmathkid (https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/).
 
 ## Build Commands
 

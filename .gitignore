@@ -1,9 +1,7 @@
 d-eggs/coordinator
 d-eggs/print_arch
-
 *~
 .viminfo
-.gitignore
 .*.sw?
 *.[0-9]*
 .vscode
@@ -16,3 +14,4 @@ logs/
 wikitext_*
 input.txt
 input.txt.zst
+.tmp-rwkv-lm-20251224/

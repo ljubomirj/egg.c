@@ -178,7 +178,7 @@ gpu-targets: $(BUILD_DIR)/egg-gpu-macos-metal$(BUILD_SUFFIX) $(BUILD_DIR)/egg-gp
 run-egg-train-rwkv-v7-gpu-linux-rocm-release:
 	@$(MAKE) BUILD=release $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm.release
 	@mkdir -p logs
-	EGG_SAVE_DIR=logs/checkpoints EGG_SAVE_EVERY=20 stdbuf -oL -eL $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm.release | tee logs/run-egg-train-rwkv-v7-gpu-linux-rocm.release.log
+	stdbuf -oL -eL $(BUILD_DIR)/egg-train-rwkv-v7-gpu-linux-rocm.release | tee logs/run-egg-train-rwkv-v7-gpu-linux-rocm.release.log
 
 clean:
 	rm -rf $(BUILD_DIR)
